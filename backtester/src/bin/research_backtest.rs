@@ -509,11 +509,46 @@ fn score_report(report: &StrategyReport) -> f64 {
         - negative_return_penalty
 }
 
+fn score_against_benchmark(strategy: &StrategyReport, benchmark: &StrategyReport) -> f64 {
+    let excess_return = strategy.total_return_pct - benchmark.total_return_pct;
+    let drawdown_reduction = benchmark.max_drawdown_pct - strategy.max_drawdown_pct;
+
+    let risk_penalty = if strategy.max_drawdown_pct > 8.0 {
+        (strategy.max_drawdown_pct - 8.0) * 2.0
+    } else {
+        0.0
+    };
+
+    let negative_return_penalty = if strategy.total_return_pct < 0.0 {
+        strategy.total_return_pct.abs() * 2.0
+    } else {
+        0.0
+    };
+
+    let low_trade_penalty = if strategy.trades < 20 {
+        8.0
+    } else {
+        0.0
+    };
+
+    strategy.total_return_pct * 0.25
+        + excess_return * 0.20
+        + strategy.sharpe_ratio * 3.0
+        + strategy.calmar_ratio * 0.8
+        + drawdown_reduction * 0.12
+        - strategy.max_drawdown_pct * 0.10
+        - risk_penalty
+        - negative_return_penalty
+        - low_trade_penalty
+}
+
 fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, StrategyReport, f64)> {
     let mut best_config: Option<StrategyConfig> = None;
     let mut best_state: Option<BacktestState> = None;
     let mut best_report: Option<StrategyReport> = None;
     let mut best_score = f64::MIN;
+    let benchmark_state = run_buy_and_hold(train);
+    let benchmark_report = summarize("train_benchmark", &benchmark_state);
 
     for short_window in [5, 8, 10, 12, 15] {
         for long_window in [20, 30, 50, 80, 100] {
@@ -541,7 +576,7 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
 
                                     let state = run_strategy(train, &config);
                                     let report = summarize("train", &state);
-                                    let score = score_report(&report);
+                                    let score = score_against_benchmark(&report, &benchmark_report);
 
                                     if report.trades >= 20
                                         && report.max_drawdown_pct <= 12.0
