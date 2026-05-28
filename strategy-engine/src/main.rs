@@ -11,7 +11,6 @@ use futures_util::StreamExt;
 use prometheus::{Encoder, IntCounter, Registry, TextEncoder};
 use redis::AsyncCommands;
 use serde_json::{json, Value};
-use shared_types::MarketTick;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::broadcast;
 
@@ -33,6 +32,61 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
         .header("Content-Type", encoder.format_type())
         .body(axum::body::Body::from(buffer))
         .unwrap()
+}
+
+fn parse_features(json_value: &Value) -> Option<FeatureSnapshot> {
+    Some(FeatureSnapshot {
+        price: json_value["price"].as_f64()?,
+        return_1: json_value["return_1"].as_f64().unwrap_or(0.0),
+        return_5: json_value["return_5"].as_f64().unwrap_or(0.0),
+        volatility_20: json_value["volatility_20"].as_f64().unwrap_or(0.0),
+        short_ma: json_value["short_ma"].as_f64().unwrap_or(0.0),
+        long_ma: json_value["long_ma"].as_f64().unwrap_or(0.0),
+        trend_strength: json_value["trend_strength"].as_f64().unwrap_or(0.0),
+        spread: json_value["spread"].as_f64().unwrap_or(0.0),
+        orderbook_imbalance: json_value["orderbook_imbalance"].as_f64().unwrap_or(0.0),
+        microprice: json_value["microprice"].as_f64().unwrap_or(0.0),
+        regime: json_value["regime"].as_str().unwrap_or("UNKNOWN").to_string(),
+        timestamp: json_value["timestamp"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+fn decide_signal(features: &FeatureSnapshot) -> &'static str {
+    let trend_up = features.short_ma > features.long_ma;
+    let trend_down = features.short_ma < features.long_ma;
+
+    let low_vol = features.volatility_20 < 0.01;
+    let spread_ok = features.spread < features.price * 0.0005;
+
+    let book_buy_support = features.orderbook_imbalance > 0.08;
+    let book_sell_support = features.orderbook_imbalance < -0.08;
+
+    let momentum_up = features.return_5 > 0.0002;
+    let momentum_down = features.return_5 < -0.0002;
+
+    if low_vol && spread_ok && trend_up && momentum_up && book_buy_support {
+        "LONG"
+    } else if low_vol && spread_ok && trend_down && momentum_down && book_sell_support {
+        "SHORT"
+    } else {
+        "FLAT"
+    }
+}
+
+#[derive(Debug)]
+struct FeatureSnapshot {
+    price: f64,
+    return_1: f64,
+    return_5: f64,
+    volatility_20: f64,
+    short_ma: f64,
+    long_ma: f64,
+    trend_strength: f64,
+    spread: f64,
+    orderbook_imbalance: f64,
+    microprice: f64,
+    regime: String,
+    timestamp: String,
 }
 
 #[tokio::main]
@@ -100,9 +154,12 @@ async fn run_strategy_engine(
     tx: broadcast::Sender<String>,
     state: AppState,
 ) {
-        println!("Connecting strategy engine to Redis...");
+    println!("Connecting strategy engine to Redis features...");
 
-    let client = redis::Client::open("redis://127.0.0.1:6379/")
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+
+    let client = redis::Client::open(redis_url)
         .expect("Failed to create Redis client");
 
     let mut pubsub = client
@@ -111,63 +168,49 @@ async fn run_strategy_engine(
         .expect("Failed to connect to Redis pubsub");
 
     pubsub
-        .subscribe("market-data:ticks")
+        .subscribe("features:latest")
         .await
-        .expect("Failed to subscribe to market-data:ticks");
+        .expect("Failed to subscribe to features:latest");
 
-    println!("Strategy engine subscribed to Redis market-data:ticks.");
+    println!("Strategy engine subscribed to Redis features:latest.");
 
     let mut stream = pubsub.on_message();
-    let mut prices: Vec<f64> = Vec::new();
 
     while let Some(msg) = stream.next().await {
         let Ok(text): Result<String, _> = msg.get_payload() else {
             continue;
         };
+
         state.redis_ticks_received.inc();
 
         let Ok(json_value) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
 
-        if json_value["event_type"] != "tick" {
-            continue;
-        }
-
-        let Ok(tick) = serde_json::from_value::<MarketTick>(json_value["data"].clone()) else {
+        let Some(features) = parse_features(&json_value) else {
             continue;
         };
 
-        prices.push(tick.price);
-
-        if prices.len() > 50 {
-            prices.remove(0);
-        }
-
-        if prices.len() < 20 {
-            continue;
-        }
-
-        let short_ma = prices[prices.len() - 5..].iter().sum::<f64>() / 5.0;
-        let long_ma = prices[prices.len() - 20..].iter().sum::<f64>() / 20.0;
-
-        let signal = if short_ma > long_ma {
-            "LONG"
-        } else if short_ma < long_ma {
-            "SHORT"
-        } else {
-            "FLAT"
-        };
+        let signal = decide_signal(&features);
 
         let payload = json!({
             "signal": signal,
-            "price": tick.price,
-            "short_ma": short_ma,
-            "long_ma": long_ma,
-            "timestamp": tick.timestamp
+            "price": features.price,
+            "short_ma": features.short_ma,
+            "long_ma": features.long_ma,
+            "trend_strength": features.trend_strength,
+            "volatility_20": features.volatility_20,
+            "return_1": features.return_1,
+            "return_5": features.return_5,
+            "spread": features.spread,
+            "orderbook_imbalance": features.orderbook_imbalance,
+            "microprice": features.microprice,
+            "regime": features.regime,
+            "timestamp": features.timestamp
         });
 
         let signal_text = payload.to_string();
+
         state.signals_generated.inc();
 
         let _ = tx.send(signal_text.clone());
@@ -180,7 +223,7 @@ async fn run_strategy_engine(
 
         println!("{}", payload);
     }
-}
+}   
 
 async fn handle_ws(
     ws: WebSocketUpgrade,
