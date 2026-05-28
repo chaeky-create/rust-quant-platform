@@ -525,7 +525,7 @@ fn score_against_benchmark(strategy: &StrategyReport, benchmark: &StrategyReport
         0.0
     };
 
-    let low_trade_penalty = if strategy.trades < 20 {
+    let low_trade_penalty = if strategy.trades < 8 {
         8.0
     } else {
         0.0
@@ -557,10 +557,10 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
             }
 
             for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
-                for min_momentum in [0.00005, 0.0001, 0.0002, 0.0005] {
-                    for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
-                        for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
-                            for take_profit_pct in [0.02, 0.04, 0.08] {
+                for min_momentum in [0.0002, 0.0005, 0.001, 0.002] {
+                    for min_trend_strength in [0.0002, 0.0005, 0.001, 0.002] {
+                        for stop_loss_pct in [0.01, 0.02, 0.03, 0.04, 0.06] {
+                            for take_profit_pct in [0.04, 0.08, 0.12, 0.16] {
                                 for base_position_size in [1.0, 1.25, 1.5] {
                                     let config = StrategyConfig {
                                         short_window,
@@ -578,7 +578,7 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
                                     let report = summarize("train", &state);
                                     let score = score_against_benchmark(&report, &benchmark_report);
 
-                                    if report.trades >= 20
+                                    if report.trades >= 8
                                         && report.max_drawdown_pct <= 12.0
                                         && score > best_score
                                     {
