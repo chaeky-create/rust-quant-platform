@@ -725,17 +725,17 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
     let benchmark_state = run_buy_and_hold(train);
     let benchmark_report = summarize("train_benchmark", &benchmark_state);
 
-    for short_window in [5, 8, 10, 12, 15] {
-        for long_window in [20, 30, 50, 80, 100] {
-            if short_window >= long_window {
+    for short_window in [8, 10, 12] {
+    for long_window in [60, 80, 100] {
+        if short_window >= long_window {
                 continue;
             }
 
             for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
-                for min_momentum in [0.0002, 0.0005, 0.001, 0.002] {
-                    for min_trend_strength in [0.0002, 0.0005, 0.001, 0.002] {
-                        for stop_loss_pct in [0.01, 0.02, 0.03, 0.04, 0.06] {
-                            for take_profit_pct in [0.04, 0.08, 0.12, 0.16] {
+                for min_momentum in [0.0003, 0.0005, 0.001, 0.002] {
+                    for min_trend_strength in [0.0003, 0.0005, 0.001, 0.002] {
+                        for stop_loss_pct in [0.015, 0.02, 0.03] {
+                            for take_profit_pct in [0.06, 0.08, 0.10] {
                                 for base_position_size in [1.0, 1.25, 1.5] {
                                     let config = StrategyConfig {
                                         short_window,
@@ -821,7 +821,6 @@ if cube_report.robustness_ratio >= 0.70 {
 } else {
     println!("robustness_label: OVERFIT_RISK");
 }
-
     let test_state = run_strategy(test, &best_config);
 
     let reports = vec![

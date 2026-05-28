@@ -19,20 +19,20 @@
   },
   {
     "name": "optimized_strategy_train",
-    "final_equity": 137873.2581709038,
-    "total_return_pct": 37.8732581709038,
-    "max_drawdown_pct": 6.034630947492051,
-    "sharpe_ratio": 1.0979297530987004,
-    "calmar_ratio": 6.275985805999231,
-    "trades": 241
+    "final_equity": 136840.89985824632,
+    "total_return_pct": 36.840899858246324,
+    "max_drawdown_pct": 4.658221386770549,
+    "sharpe_ratio": 1.072641875723641,
+    "calmar_ratio": 7.908791102731889,
+    "trades": 249
   },
   {
     "name": "optimized_strategy_test",
-    "final_equity": 113130.11383604456,
-    "total_return_pct": 13.130113836044563,
+    "final_equity": 113728.17029584623,
+    "total_return_pct": 13.728170295846226,
     "max_drawdown_pct": 5.230633993764107,
-    "sharpe_ratio": 0.7257000692974366,
-    "calmar_ratio": 2.5102337215140866,
+    "sharpe_ratio": 0.7524874079063332,
+    "calmar_ratio": 2.6245710008027268,
     "trades": 73
   }
 ]
