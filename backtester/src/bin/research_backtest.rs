@@ -53,6 +53,18 @@ struct StrategyReport {
 }
 
 #[derive(Debug, Clone)]
+struct ParameterCubeReport {
+    best_score: f64,
+    neighbor_count: usize,
+    avg_neighbor_score: f64,
+    median_neighbor_score: f64,
+    min_neighbor_score: f64,
+    max_neighbor_score: f64,
+    robustness_ratio: f64,
+    score_gap: f64,
+}
+
+#[derive(Debug, Clone)]
 struct CandidateResult {
     config: StrategyConfig,
     train_report: StrategyReport,
@@ -542,6 +554,169 @@ fn score_against_benchmark(strategy: &StrategyReport, benchmark: &StrategyReport
         - low_trade_penalty
 }
 
+fn parameter_cube_analysis(
+    train: &[Bar],
+    best_config: &StrategyConfig,
+    best_score: f64,
+) -> ParameterCubeReport {
+    let benchmark_state = run_buy_and_hold(train);
+    let benchmark_report = summarize("cube_benchmark", &benchmark_state);
+
+    let short_values = unique_sorted_usize(vec![
+        best_config.short_window.saturating_sub(2).max(2),
+        best_config.short_window,
+        best_config.short_window + 2,
+    ]);
+
+    let long_values = unique_sorted_usize(vec![
+        best_config.long_window.saturating_sub(20).max(best_config.short_window + 1),
+        best_config.long_window,
+        best_config.long_window + 20,
+    ]);
+
+    let max_vol_values = unique_sorted_f64(vec![
+        (best_config.max_volatility * 0.75).max(0.001),
+        best_config.max_volatility,
+        best_config.max_volatility * 1.25,
+    ]);
+
+    let momentum_values = unique_sorted_f64(vec![
+        (best_config.min_momentum * 0.5).max(0.00005),
+        best_config.min_momentum,
+        best_config.min_momentum * 2.0,
+    ]);
+
+    let trend_values = unique_sorted_f64(vec![
+        (best_config.min_trend_strength * 0.5).max(0.00005),
+        best_config.min_trend_strength,
+        best_config.min_trend_strength * 2.0,
+    ]);
+
+    let stop_values = unique_sorted_f64(vec![
+        (best_config.stop_loss_pct * 0.5).max(0.005),
+        best_config.stop_loss_pct,
+        best_config.stop_loss_pct * 1.5,
+    ]);
+
+    let take_profit_values = unique_sorted_f64(vec![
+        (best_config.take_profit_pct * 0.75).max(0.02),
+        best_config.take_profit_pct,
+        best_config.take_profit_pct * 1.25,
+    ]);
+
+    let size_values = unique_sorted_f64(vec![
+        (best_config.base_position_size - 0.25).max(0.5),
+        best_config.base_position_size,
+        best_config.base_position_size + 0.25,
+    ]);
+
+    let mut scores: Vec<f64> = Vec::new();
+
+    for short_window in short_values {
+        for long_window in &long_values {
+            if short_window >= *long_window {
+                continue;
+            }
+
+            for max_volatility in &max_vol_values {
+                for min_momentum in &momentum_values {
+                    for min_trend_strength in &trend_values {
+                        for stop_loss_pct in &stop_values {
+                            for take_profit_pct in &take_profit_values {
+                                for base_position_size in &size_values {
+                                    let config = StrategyConfig {
+                                        short_window,
+                                        long_window: *long_window,
+                                        volatility_window: best_config.volatility_window,
+                                        max_volatility: *max_volatility,
+                                        min_momentum: *min_momentum,
+                                        min_trend_strength: *min_trend_strength,
+                                        stop_loss_pct: *stop_loss_pct,
+                                        take_profit_pct: *take_profit_pct,
+                                        base_position_size: *base_position_size,
+                                    };
+
+                                    let state = run_strategy(train, &config);
+                                    let report = summarize("cube_neighbor", &state);
+
+                                    if report.trades < 8 || report.max_drawdown_pct > 12.0 {
+                                        continue;
+                                    }
+
+                                    let score =
+                                        score_against_benchmark(&report, &benchmark_report);
+                                    scores.push(score);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if scores.is_empty() {
+        return ParameterCubeReport {
+            best_score,
+            neighbor_count: 0,
+            avg_neighbor_score: 0.0,
+            median_neighbor_score: 0.0,
+            min_neighbor_score: 0.0,
+            max_neighbor_score: 0.0,
+            robustness_ratio: 0.0,
+            score_gap: best_score,
+        };
+    }
+
+    scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let neighbor_count = scores.len();
+    let min_neighbor_score = scores[0];
+    let max_neighbor_score = scores[neighbor_count - 1];
+    let avg_neighbor_score = scores.iter().sum::<f64>() / neighbor_count as f64;
+
+    let median_neighbor_score = if neighbor_count % 2 == 0 {
+        let a = scores[neighbor_count / 2 - 1];
+        let b = scores[neighbor_count / 2];
+        (a + b) / 2.0
+    } else {
+        scores[neighbor_count / 2]
+    };
+
+    let robustness_ratio = if best_score.abs() > 1e-9 {
+        median_neighbor_score / best_score
+    } else {
+        0.0
+    };
+
+    let score_gap = best_score - median_neighbor_score;
+
+    ParameterCubeReport {
+        best_score,
+        neighbor_count,
+        avg_neighbor_score,
+        median_neighbor_score,
+        min_neighbor_score,
+        max_neighbor_score,
+        robustness_ratio,
+        score_gap,
+    }
+}
+
+fn unique_sorted_usize(values: Vec<usize>) -> Vec<usize> {
+    let mut values = values;
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn unique_sorted_f64(values: Vec<f64>) -> Vec<f64> {
+    let mut values = values;
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    values
+}
+
 fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, StrategyReport, f64)> {
     let mut best_config: Option<StrategyConfig> = None;
     let mut best_state: Option<BacktestState> = None;
@@ -626,6 +801,26 @@ println!("train_sharpe: {:.4}", best_train_report.sharpe_ratio);
 println!("train_calmar: {:.4}", best_train_report.calmar_ratio);
 println!("train_trades: {}", best_train_report.trades);
 
+let cube_report = parameter_cube_analysis(train, &best_config, best_train_score);
+
+println!();
+println!("=== PARAMETER CUBE ROBUSTNESS ===");
+println!("neighbor_count: {}", cube_report.neighbor_count);
+println!("best_score: {:.4}", cube_report.best_score);
+println!("avg_neighbor_score: {:.4}", cube_report.avg_neighbor_score);
+println!("median_neighbor_score: {:.4}", cube_report.median_neighbor_score);
+println!("min_neighbor_score: {:.4}", cube_report.min_neighbor_score);
+println!("max_neighbor_score: {:.4}", cube_report.max_neighbor_score);
+println!("robustness_ratio: {:.4}", cube_report.robustness_ratio);
+println!("score_gap: {:.4}", cube_report.score_gap);
+
+if cube_report.robustness_ratio >= 0.70 {
+    println!("robustness_label: ROBUST");
+} else if cube_report.robustness_ratio >= 0.40 {
+    println!("robustness_label: MODERATE");
+} else {
+    println!("robustness_label: OVERFIT_RISK");
+}
 
     let test_state = run_strategy(test, &best_config);
 
