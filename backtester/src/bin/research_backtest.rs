@@ -379,9 +379,21 @@ fn position_size(features: &FeatureSnapshot, config: &StrategyConfig) -> f64 {
         return config.base_position_size;
     }
 
-    let vol_scale = (target_vol / features.volatility_20).clamp(0.25, 2.0);
+    let vol_scale = (target_vol / features.volatility_20).clamp(0.35, 2.5);
 
-    config.base_position_size * vol_scale
+    let strong_bull =
+        features.price > features.long_term_ma
+        && features.short_ma > features.long_ma
+        && features.return_5 > config.min_momentum * 2.0
+        && features.volatility_20 <= config.max_volatility;
+
+    let risk_on_multiplier = if strong_bull {
+        1.5
+    } else {
+        1.0
+    };
+
+    config.base_position_size * vol_scale * risk_on_multiplier
 }
 
 fn run_strategy(bars: &[Bar], config: &StrategyConfig) -> BacktestState {
@@ -514,30 +526,32 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
                     for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
                         for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
                             for take_profit_pct in [0.02, 0.04, 0.08] {
-                                let config = StrategyConfig {
-                                    short_window,
-                                    long_window,
-                                    volatility_window: 20,
-                                    max_volatility,
-                                    min_momentum,
-                                    min_trend_strength,
-                                    stop_loss_pct,
-                                    take_profit_pct,
-                                    base_position_size: 1.0,
-                                };
+                                for base_position_size in [1.0, 1.25, 1.5] {
+                                    let config = StrategyConfig {
+                                        short_window,
+                                        long_window,
+                                        volatility_window: 20,
+                                        max_volatility,
+                                        min_momentum,
+                                        min_trend_strength,
+                                        stop_loss_pct,
+                                        take_profit_pct,
+                                        base_position_size,
+                                    };
 
-                                let state = run_strategy(train, &config);
-                                let report = summarize("train", &state);
-                                let score = score_report(&report);
+                                    let state = run_strategy(train, &config);
+                                    let report = summarize("train", &state);
+                                    let score = score_report(&report);
 
-                                if report.trades >= 20
-                                    && report.max_drawdown_pct <= 12.0
-                                    && score > best_score
-                                {
-                                    best_score = score;
-                                    best_config = Some(config);
-                                    best_state = Some(state);
-                                    best_report = Some(report);
+                                    if report.trades >= 20
+                                        && report.max_drawdown_pct <= 12.0
+                                        && score > best_score
+                                    {
+                                        best_score = score;
+                                        best_config = Some(config);
+                                        best_state = Some(state);
+                                        best_report = Some(report);
+                                    }
                                 }
                             }
                         }
@@ -547,12 +561,7 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
         }
     }
 
-    Some((
-        best_config?,
-        best_state?,
-        best_report?,
-        best_score,
-    ))
+    Some((best_config?, best_state?, best_report?, best_score))
 }
 
 
@@ -570,117 +579,18 @@ fn main() {
     let buy_hold_train = run_buy_and_hold(train);
     let buy_hold_test = run_buy_and_hold(test);
 
-    let mut best_config: Option<StrategyConfig> = None;
-    let mut best_train_score = f64::MIN;
-    let mut best_train_state: Option<BacktestState> = None;
-    let mut candidates: Vec<CandidateResult> = Vec::new();
+    let (best_config, best_train_state, best_train_report, best_train_score) =
+    optimize_on_train(train).expect("No valid config found");
 
-    for short_window in [5, 8, 10, 12, 15] {
-        for long_window in [20, 30, 50, 80, 100] {
-            if short_window >= long_window {
-                continue;
-            }
+println!();
+println!("=== BEST TRAIN RESULT ===");
+println!("score: {:.4}", best_train_score);
+println!("train_return: {:.4}%", best_train_report.total_return_pct);
+println!("train_max_drawdown: {:.4}%", best_train_report.max_drawdown_pct);
+println!("train_sharpe: {:.4}", best_train_report.sharpe_ratio);
+println!("train_calmar: {:.4}", best_train_report.calmar_ratio);
+println!("train_trades: {}", best_train_report.trades);
 
-            for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
-                for min_momentum in [0.00005, 0.0001, 0.0002, 0.0005] {
-                    for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
-                        for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
-                            for take_profit_pct in [0.02, 0.04, 0.08] {
-                                let config = StrategyConfig {
-                                    short_window,
-                                    long_window,
-                                    volatility_window: 20,
-                                    max_volatility,
-                                    min_momentum,
-                                    min_trend_strength,
-                                    stop_loss_pct,
-                                    take_profit_pct,
-                                    base_position_size: 1.0,
-                                };
-
-                                let state = run_strategy(train, &config);
-                                let report = summarize("train", &state);
-
-                                let risk_penalty = if report.max_drawdown_pct > 8.0 {
-                                    (report.max_drawdown_pct - 8.0) * 2.0
-                                } else {
-                                    0.0
-                                };
-                                
-                                let trade_penalty = if report.trades < 20 {
-                                    10.0
-                                } else {
-                                    0.0
-                                };
-                                
-                                let negative_return_penalty = if report.total_return_pct < 0.0 {
-                                    report.total_return_pct.abs() * 2.0
-                                } else {
-                                    0.0
-                                };
-                                
-                                let score =
-                                    report.total_return_pct * 0.20
-                                    + report.sharpe_ratio * 3.0
-                                    + report.calmar_ratio * 1.0
-                                    - report.max_drawdown_pct * 0.15
-                                    - risk_penalty
-                                    - trade_penalty
-                                    - negative_return_penalty;
-                                
-                                if report.trades >= 20 && report.max_drawdown_pct <= 12.0 {
-                                    candidates.push(CandidateResult {
-                                        config: config.clone(),
-                                        train_report: report.clone(),
-                                        score,
-                                    });
-                                
-                                    if score > best_train_score {
-                                        best_train_score = score;
-                                        best_config = Some(config.clone());
-                                        best_train_state = Some(state);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    candidates.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    
-    println!();
-    println!("=== TOP 10 TRAIN CANDIDATES ===");
-    
-    for (i, candidate) in candidates.iter().take(10).enumerate() {
-        println!(
-            "#{:<2} score={:.4} return={:.4}% dd={:.4}% sharpe={:.4} calmar={:.4} trades={} | short={} long={} vol={} mom={} trend={} sl={} tp={} size={}",
-            i + 1,
-            candidate.score,
-            candidate.train_report.total_return_pct,
-            candidate.train_report.max_drawdown_pct,
-            candidate.train_report.sharpe_ratio,
-            candidate.train_report.calmar_ratio,
-            candidate.train_report.trades,
-            candidate.config.short_window,
-            candidate.config.long_window,
-            candidate.config.max_volatility,
-            candidate.config.min_momentum,
-            candidate.config.min_trend_strength,
-            candidate.config.stop_loss_pct,
-            candidate.config.take_profit_pct,
-            candidate.config.base_position_size,
-        );
-    }
-
-    let best_config = best_config.expect("No valid config found");
-    let best_train_state = best_train_state.expect("No valid state found");
 
     let test_state = run_strategy(test, &best_config);
 
