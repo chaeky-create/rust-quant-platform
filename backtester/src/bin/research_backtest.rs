@@ -66,11 +66,20 @@ struct WalkForwardResult {
     train_end: usize,
     test_start: usize,
     test_end: usize,
-    test_return_pct: f64,
-    test_max_drawdown_pct: f64,
-    test_sharpe_ratio: f64,
-    test_calmar_ratio: f64,
-    test_trades: usize,
+
+    strategy_return_pct: f64,
+    strategy_max_drawdown_pct: f64,
+    strategy_sharpe_ratio: f64,
+    strategy_calmar_ratio: f64,
+    strategy_trades: usize,
+
+    benchmark_return_pct: f64,
+    benchmark_max_drawdown_pct: f64,
+    benchmark_sharpe_ratio: f64,
+
+    excess_return_pct: f64,
+    drawdown_reduction_pct: f64,
+
     short_window: usize,
     long_window: usize,
     max_volatility: f64,
@@ -739,8 +748,19 @@ fn main() {
         let wf_test = &bars[test_start..test_end];
 
         if let Some((wf_config, _, _, _)) = optimize_on_train(wf_train) {
-            let wf_test_state = run_strategy(wf_test, &wf_config);
-            let wf_test_report = summarize("walk_forward_test", &wf_test_state);
+            let wf_strategy_state = run_strategy(wf_test, &wf_config);
+
+
+            let wf_strategy_report = summarize("walk_forward_strategy", &wf_strategy_state);
+
+            let wf_benchmark_state = run_buy_and_hold(wf_test);
+            let wf_benchmark_report = summarize("walk_forward_benchmark", &wf_benchmark_state);
+
+            let excess_return_pct =
+                wf_strategy_report.total_return_pct - wf_benchmark_report.total_return_pct;
+
+            let drawdown_reduction_pct =
+                wf_benchmark_report.max_drawdown_pct - wf_strategy_report.max_drawdown_pct;
 
             walk_forward_results.push(WalkForwardResult {
                 window: window_id,
@@ -748,11 +768,20 @@ fn main() {
                 train_end,
                 test_start,
                 test_end,
-                test_return_pct: wf_test_report.total_return_pct,
-                test_max_drawdown_pct: wf_test_report.max_drawdown_pct,
-                test_sharpe_ratio: wf_test_report.sharpe_ratio,
-                test_calmar_ratio: wf_test_report.calmar_ratio,
-                test_trades: wf_test_report.trades,
+
+                strategy_return_pct: wf_strategy_report.total_return_pct,
+                strategy_max_drawdown_pct: wf_strategy_report.max_drawdown_pct,
+                strategy_sharpe_ratio: wf_strategy_report.sharpe_ratio,
+                strategy_calmar_ratio: wf_strategy_report.calmar_ratio,
+                strategy_trades: wf_strategy_report.trades,
+
+                benchmark_return_pct: wf_benchmark_report.total_return_pct,
+                benchmark_max_drawdown_pct: wf_benchmark_report.max_drawdown_pct,
+                benchmark_sharpe_ratio: wf_benchmark_report.sharpe_ratio,
+
+                excess_return_pct,
+                drawdown_reduction_pct,
+
                 short_window: wf_config.short_window,
                 long_window: wf_config.long_window,
                 max_volatility: wf_config.max_volatility,
@@ -761,7 +790,7 @@ fn main() {
                 stop_loss_pct: wf_config.stop_loss_pct,
                 take_profit_pct: wf_config.take_profit_pct,
             });
-        }
+                    }
 
         start += step;
         window_id += 1;
@@ -772,13 +801,16 @@ fn main() {
 
     for result in &walk_forward_results {
         println!(
-            "window={} test_return={:.4}% dd={:.4}% sharpe={:.4} calmar={:.4} trades={} | short={} long={} vol={} mom={} trend={} sl={} tp={}",
+            "window={} strategy_return={:.4}% benchmark_return={:.4}% excess={:.4}% strategy_dd={:.4}% benchmark_dd={:.4}% dd_reduction={:.4}% sharpe={:.4} trades={} | short={} long={} vol={} mom={} trend={} sl={} tp={}",
             result.window,
-            result.test_return_pct,
-            result.test_max_drawdown_pct,
-            result.test_sharpe_ratio,
-            result.test_calmar_ratio,
-            result.test_trades,
+            result.strategy_return_pct,
+            result.benchmark_return_pct,
+            result.excess_return_pct,
+            result.strategy_max_drawdown_pct,
+            result.benchmark_max_drawdown_pct,
+            result.drawdown_reduction_pct,
+            result.strategy_sharpe_ratio,
+            result.strategy_trades,
             result.short_window,
             result.long_window,
             result.max_volatility,
@@ -792,38 +824,79 @@ fn main() {
     if !walk_forward_results.is_empty() {
         let n = walk_forward_results.len() as f64;
 
-        let avg_return = walk_forward_results
+        let avg_strategy_return = walk_forward_results
             .iter()
-            .map(|r| r.test_return_pct)
+            .map(|r| r.strategy_return_pct)
             .sum::<f64>()
             / n;
 
-        let avg_dd = walk_forward_results
+        let avg_benchmark_return = walk_forward_results
             .iter()
-            .map(|r| r.test_max_drawdown_pct)
+            .map(|r| r.benchmark_return_pct)
             .sum::<f64>()
             / n;
 
-        let avg_sharpe = walk_forward_results
+        let avg_excess_return = walk_forward_results
             .iter()
-            .map(|r| r.test_sharpe_ratio)
+            .map(|r| r.excess_return_pct)
             .sum::<f64>()
             / n;
 
-        let positive_windows = walk_forward_results
+        let avg_strategy_dd = walk_forward_results
             .iter()
-            .filter(|r| r.test_return_pct > 0.0)
+            .map(|r| r.strategy_max_drawdown_pct)
+            .sum::<f64>()
+            / n;
+
+        let avg_benchmark_dd = walk_forward_results
+            .iter()
+            .map(|r| r.benchmark_max_drawdown_pct)
+            .sum::<f64>()
+            / n;
+
+        let avg_drawdown_reduction = walk_forward_results
+            .iter()
+            .map(|r| r.drawdown_reduction_pct)
+            .sum::<f64>()
+            / n;
+
+        let avg_strategy_sharpe = walk_forward_results
+            .iter()
+            .map(|r| r.strategy_sharpe_ratio)
+            .sum::<f64>()
+            / n;
+
+        let positive_strategy_windows = walk_forward_results
+            .iter()
+            .filter(|r| r.strategy_return_pct > 0.0)
+            .count();
+
+        let outperform_windows = walk_forward_results
+            .iter()
+            .filter(|r| r.excess_return_pct > 0.0)
             .count();
 
         println!();
         println!("=== WALK-FORWARD SUMMARY ===");
         println!("Windows: {}", walk_forward_results.len());
-        println!("Average Test Return: {:.4}%", avg_return);
-        println!("Average Test Max Drawdown: {:.4}%", avg_dd);
-        println!("Average Test Sharpe: {:.4}", avg_sharpe);
+        println!("Average Strategy Return: {:.4}%", avg_strategy_return);
+        println!("Average Benchmark Return: {:.4}%", avg_benchmark_return);
+        println!("Average Excess Return: {:.4}%", avg_excess_return);
+        println!("Average Strategy Max Drawdown: {:.4}%", avg_strategy_dd);
+        println!("Average Benchmark Max Drawdown: {:.4}%", avg_benchmark_dd);
         println!(
-            "Positive Windows: {}/{}",
-            positive_windows,
+            "Average Drawdown Reduction: {:.4}%",
+            avg_drawdown_reduction
+        );
+        println!("Average Strategy Sharpe: {:.4}", avg_strategy_sharpe);
+        println!(
+            "Positive Strategy Windows: {}/{}",
+            positive_strategy_windows,
+            walk_forward_results.len()
+        );
+        println!(
+            "Outperform Benchmark Windows: {}/{}",
+            outperform_windows,
             walk_forward_results.len()
         );
 
@@ -833,7 +906,7 @@ fn main() {
 
         println!("Saved walk-forward report to walk_forward_report.json");
     }
-    
+
     println!();
     println!("Saved report to backtest_report.json");
     println!("Saved test equity curve to equity_curve.csv");
