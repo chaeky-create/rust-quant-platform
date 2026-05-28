@@ -59,6 +59,27 @@ struct CandidateResult {
     score: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WalkForwardResult {
+    window: usize,
+    train_start: usize,
+    train_end: usize,
+    test_start: usize,
+    test_end: usize,
+    test_return_pct: f64,
+    test_max_drawdown_pct: f64,
+    test_sharpe_ratio: f64,
+    test_calmar_ratio: f64,
+    test_trades: usize,
+    short_window: usize,
+    long_window: usize,
+    max_volatility: f64,
+    min_momentum: f64,
+    min_trend_strength: f64,
+    stop_loss_pct: f64,
+    take_profit_pct: f64,
+}
+
 impl BacktestState {
     fn new() -> Self {
         Self {
@@ -439,6 +460,93 @@ fn summarize(name: &str, state: &BacktestState) -> StrategyReport {
     }
 }
 
+fn score_report(report: &StrategyReport) -> f64 {
+    let risk_penalty = if report.max_drawdown_pct > 8.0 {
+        (report.max_drawdown_pct - 8.0) * 2.0
+    } else {
+        0.0
+    };
+
+    let trade_penalty = if report.trades < 20 {
+        10.0
+    } else {
+        0.0
+    };
+
+    let negative_return_penalty = if report.total_return_pct < 0.0 {
+        report.total_return_pct.abs() * 2.0
+    } else {
+        0.0
+    };
+
+    report.total_return_pct * 0.20
+        + report.sharpe_ratio * 3.0
+        + report.calmar_ratio * 1.0
+        - report.max_drawdown_pct * 0.15
+        - risk_penalty
+        - trade_penalty
+        - negative_return_penalty
+}
+
+fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, StrategyReport, f64)> {
+    let mut best_config: Option<StrategyConfig> = None;
+    let mut best_state: Option<BacktestState> = None;
+    let mut best_report: Option<StrategyReport> = None;
+    let mut best_score = f64::MIN;
+
+    for short_window in [5, 8, 10, 12, 15] {
+        for long_window in [20, 30, 50, 80, 100] {
+            if short_window >= long_window {
+                continue;
+            }
+
+            for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
+                for min_momentum in [0.00005, 0.0001, 0.0002, 0.0005] {
+                    for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
+                        for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
+                            for take_profit_pct in [0.02, 0.04, 0.08] {
+                                let config = StrategyConfig {
+                                    short_window,
+                                    long_window,
+                                    volatility_window: 20,
+                                    max_volatility,
+                                    min_momentum,
+                                    min_trend_strength,
+                                    stop_loss_pct,
+                                    take_profit_pct,
+                                    base_position_size: 1.0,
+                                };
+
+                                let state = run_strategy(train, &config);
+                                let report = summarize("train", &state);
+                                let score = score_report(&report);
+
+                                if report.trades >= 20
+                                    && report.max_drawdown_pct <= 12.0
+                                    && score > best_score
+                                {
+                                    best_score = score;
+                                    best_config = Some(config);
+                                    best_state = Some(state);
+                                    best_report = Some(report);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some((
+        best_config?,
+        best_state?,
+        best_report?,
+        best_score,
+    ))
+}
+
+
 fn main() {
     let bars = load_csv("data/btc.csv");
 
@@ -610,6 +718,122 @@ fn main() {
 
     fs::write("equity_curve.csv", equity_csv).expect("Failed to write equity_curve.csv");
 
+
+
+    let train_window = 700;
+    let test_window = 180;
+    let step = 180;
+
+    let mut walk_forward_results: Vec<WalkForwardResult> = Vec::new();
+
+    let mut start = 0;
+    let mut window_id = 1;
+
+    while start + train_window + test_window <= bars.len() {
+        let train_start = start;
+        let train_end = start + train_window;
+        let test_start = train_end;
+        let test_end = train_end + test_window;
+
+        let wf_train = &bars[train_start..train_end];
+        let wf_test = &bars[test_start..test_end];
+
+        if let Some((wf_config, _, _, _)) = optimize_on_train(wf_train) {
+            let wf_test_state = run_strategy(wf_test, &wf_config);
+            let wf_test_report = summarize("walk_forward_test", &wf_test_state);
+
+            walk_forward_results.push(WalkForwardResult {
+                window: window_id,
+                train_start,
+                train_end,
+                test_start,
+                test_end,
+                test_return_pct: wf_test_report.total_return_pct,
+                test_max_drawdown_pct: wf_test_report.max_drawdown_pct,
+                test_sharpe_ratio: wf_test_report.sharpe_ratio,
+                test_calmar_ratio: wf_test_report.calmar_ratio,
+                test_trades: wf_test_report.trades,
+                short_window: wf_config.short_window,
+                long_window: wf_config.long_window,
+                max_volatility: wf_config.max_volatility,
+                min_momentum: wf_config.min_momentum,
+                min_trend_strength: wf_config.min_trend_strength,
+                stop_loss_pct: wf_config.stop_loss_pct,
+                take_profit_pct: wf_config.take_profit_pct,
+            });
+        }
+
+        start += step;
+        window_id += 1;
+    }
+
+    println!();
+    println!("=== WALK-FORWARD VALIDATION ===");
+
+    for result in &walk_forward_results {
+        println!(
+            "window={} test_return={:.4}% dd={:.4}% sharpe={:.4} calmar={:.4} trades={} | short={} long={} vol={} mom={} trend={} sl={} tp={}",
+            result.window,
+            result.test_return_pct,
+            result.test_max_drawdown_pct,
+            result.test_sharpe_ratio,
+            result.test_calmar_ratio,
+            result.test_trades,
+            result.short_window,
+            result.long_window,
+            result.max_volatility,
+            result.min_momentum,
+            result.min_trend_strength,
+            result.stop_loss_pct,
+            result.take_profit_pct,
+        );
+    }
+
+    if !walk_forward_results.is_empty() {
+        let n = walk_forward_results.len() as f64;
+
+        let avg_return = walk_forward_results
+            .iter()
+            .map(|r| r.test_return_pct)
+            .sum::<f64>()
+            / n;
+
+        let avg_dd = walk_forward_results
+            .iter()
+            .map(|r| r.test_max_drawdown_pct)
+            .sum::<f64>()
+            / n;
+
+        let avg_sharpe = walk_forward_results
+            .iter()
+            .map(|r| r.test_sharpe_ratio)
+            .sum::<f64>()
+            / n;
+
+        let positive_windows = walk_forward_results
+            .iter()
+            .filter(|r| r.test_return_pct > 0.0)
+            .count();
+
+        println!();
+        println!("=== WALK-FORWARD SUMMARY ===");
+        println!("Windows: {}", walk_forward_results.len());
+        println!("Average Test Return: {:.4}%", avg_return);
+        println!("Average Test Max Drawdown: {:.4}%", avg_dd);
+        println!("Average Test Sharpe: {:.4}", avg_sharpe);
+        println!(
+            "Positive Windows: {}/{}",
+            positive_windows,
+            walk_forward_results.len()
+        );
+
+        let wf_json = serde_json::to_string_pretty(&walk_forward_results).unwrap();
+        fs::write("walk_forward_report.json", wf_json)
+            .expect("Failed to write walk_forward_report.json");
+
+        println!("Saved walk-forward report to walk_forward_report.json");
+    }
+    
     println!();
     println!("Saved report to backtest_report.json");
     println!("Saved test equity curve to equity_curve.csv");
