@@ -41,7 +41,7 @@ struct BacktestState {
     trades: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct StrategyReport {
     name: String,
     final_equity: f64,
@@ -50,6 +50,13 @@ struct StrategyReport {
     sharpe_ratio: f64,
     calmar_ratio: f64,
     trades: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateResult {
+    config: StrategyConfig,
+    train_report: StrategyReport,
+    score: f64,
 }
 
 impl BacktestState {
@@ -318,9 +325,17 @@ fn decide_signal(features: &FeatureSnapshot, config: &StrategyConfig) -> &'stati
     let uptrend = features.trend_strength > config.min_trend_strength;
     let positive_momentum = features.return_5 > config.min_momentum;
     let not_crashing = features.return_1 > -config.stop_loss_pct * 0.25;
+
     let bull_market = features.price > features.long_term_ma;
 
-    if bull_market && low_vol && uptrend && positive_momentum && not_crashing {
+    let recovery_market =
+        features.price > features.long_ma
+        && features.return_5 > 0.0
+        && features.volatility_20 <= config.max_volatility * 1.5;
+
+    if not_crashing && low_vol && uptrend && positive_momentum {
+        "LONG"
+    } else if not_crashing && bull_market && recovery_market {
         "LONG"
     } else {
         "FLAT"
@@ -441,6 +456,7 @@ fn main() {
     let mut best_config: Option<StrategyConfig> = None;
     let mut best_train_score = f64::MIN;
     let mut best_train_state: Option<BacktestState> = None;
+    let mut candidates: Vec<CandidateResult> = Vec::new();
 
     for short_window in [5, 8, 10, 12, 15] {
         for long_window in [20, 30, 50, 80, 100] {
@@ -448,7 +464,7 @@ fn main() {
                 continue;
             }
 
-            for max_volatility in [0.002, 0.005, 0.01, 0.02] {
+            for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
                 for min_momentum in [0.00005, 0.0001, 0.0002, 0.0005] {
                     for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
                         for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
@@ -468,15 +484,45 @@ fn main() {
                                 let state = run_strategy(train, &config);
                                 let report = summarize("train", &state);
 
-                                let score = report.sharpe_ratio * 2.0
-                                    + report.calmar_ratio * 0.8
-                                    + report.total_return_pct * 0.03
-                                    - report.max_drawdown_pct * 0.08;
-
-                                if report.trades >= 5 && score > best_train_score {
-                                    best_train_score = score;
-                                    best_config = Some(config.clone());
-                                    best_train_state = Some(state);
+                                let risk_penalty = if report.max_drawdown_pct > 8.0 {
+                                    (report.max_drawdown_pct - 8.0) * 2.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                let trade_penalty = if report.trades < 20 {
+                                    10.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                let negative_return_penalty = if report.total_return_pct < 0.0 {
+                                    report.total_return_pct.abs() * 2.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                let score =
+                                    report.total_return_pct * 0.20
+                                    + report.sharpe_ratio * 3.0
+                                    + report.calmar_ratio * 1.0
+                                    - report.max_drawdown_pct * 0.15
+                                    - risk_penalty
+                                    - trade_penalty
+                                    - negative_return_penalty;
+                                
+                                if report.trades >= 20 && report.max_drawdown_pct <= 12.0 {
+                                    candidates.push(CandidateResult {
+                                        config: config.clone(),
+                                        train_report: report.clone(),
+                                        score,
+                                    });
+                                
+                                    if score > best_train_score {
+                                        best_train_score = score;
+                                        best_config = Some(config.clone());
+                                        best_train_state = Some(state);
+                                    }
                                 }
                             }
                         }
@@ -484,6 +530,36 @@ fn main() {
                 }
             }
         }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    
+    println!();
+    println!("=== TOP 10 TRAIN CANDIDATES ===");
+    
+    for (i, candidate) in candidates.iter().take(10).enumerate() {
+        println!(
+            "#{:<2} score={:.4} return={:.4}% dd={:.4}% sharpe={:.4} calmar={:.4} trades={} | short={} long={} vol={} mom={} trend={} sl={} tp={} size={}",
+            i + 1,
+            candidate.score,
+            candidate.train_report.total_return_pct,
+            candidate.train_report.max_drawdown_pct,
+            candidate.train_report.sharpe_ratio,
+            candidate.train_report.calmar_ratio,
+            candidate.train_report.trades,
+            candidate.config.short_window,
+            candidate.config.long_window,
+            candidate.config.max_volatility,
+            candidate.config.min_momentum,
+            candidate.config.min_trend_strength,
+            candidate.config.stop_loss_pct,
+            candidate.config.take_profit_pct,
+            candidate.config.base_position_size,
+        );
     }
 
     let best_config = best_config.expect("No valid config found");
