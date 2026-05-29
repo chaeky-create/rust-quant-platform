@@ -37,6 +37,16 @@ struct Holding {
     weight: f64,
 }
 
+#[derive(Debug, Clone)]
+struct RadmOptions {
+    name: String,
+    use_regime_filter: bool,
+    use_drawdown_governor: bool,
+    use_momentum_rotation: bool,
+    fee_bps: f64,
+    slippage_bps: f64,
+}
+
 const INITIAL_CAPITAL: f64 = 10_000.0;
 
 fn load_csv(symbol: &str, path: &str) -> Option<AssetSeries> {
@@ -253,26 +263,37 @@ fn rebalance(
     holdings: &[Holding],
     prices: &HashMap<String, f64>,
     total_equity: f64,
+    fee_bps: f64,
+    slippage_bps: f64,
 ) {
-    state.cash = total_equity;
-    state.positions.clear();
+    let fee_rate = fee_bps / 10_000.0;
+    let slippage_rate = slippage_bps / 10_000.0;
+
+    let mut new_cash = total_equity;
+    let mut new_positions: HashMap<String, f64> = HashMap::new();
 
     for holding in holdings {
         let Some(price) = prices.get(&holding.symbol) else {
             continue;
         };
 
-        if *price <= 0.0 {
+        if *price <= 0.0 || holding.weight <= 0.0 {
             continue;
         }
 
+        let execution_price = price * (1.0 + slippage_rate);
         let target_value = total_equity * holding.weight;
-        let qty = target_value / price;
+        let fee = target_value.abs() * fee_rate;
+        let net_target_value = (target_value - fee).max(0.0);
+        let qty = net_target_value / execution_price;
 
-        state.cash -= target_value;
-        state.positions.insert(holding.symbol.clone(), qty);
+        new_cash -= target_value;
+        new_positions.insert(holding.symbol.clone(), qty);
         state.trades += 1;
     }
+
+    state.cash = new_cash;
+    state.positions = new_positions;
 }
 
 fn determine_regime(spy_prices: &[f64], idx: usize) -> String {
@@ -384,6 +405,20 @@ fn select_holdings(
 }
 
 fn run_radm_strategy(assets: &[AssetSeries]) -> PortfolioState {
+    
+    let options = RadmOptions {
+        name: "RADM_strategy".to_string(),
+        use_regime_filter: true,
+        use_drawdown_governor: true,
+        use_momentum_rotation: true,
+        fee_bps: 0.0,
+        slippage_bps: 0.0,
+    };
+
+    run_radm_strategy_with_options(assets, &options)
+}
+
+fn run_radm_strategy_with_options(assets: &[AssetSeries], options: &RadmOptions) -> PortfolioState {
     let len = aligned_len(assets);
 
     let mut state = PortfolioState {
@@ -412,11 +447,44 @@ fn run_radm_strategy(assets: &[AssetSeries]) -> PortfolioState {
         let is_rebalance_day = idx == 252 || idx % 21 == 0;
 
         if is_rebalance_day {
-            let regime = determine_regime(&spy_prices, idx);
-            let exposure = drawdown_exposure(current_equity, state.peak_equity, &regime);
-            let holdings = select_holdings(assets, idx, &regime, exposure);
+            let regime = if options.use_regime_filter {
+                determine_regime(&spy_prices, idx)
+            } else {
+                "BULL".to_string()
+            };
 
-            rebalance(&mut state, &holdings, &prices, current_equity);
+            let exposure = if options.use_drawdown_governor {
+                drawdown_exposure(current_equity, state.peak_equity, &regime)
+            } else {
+                match regime.as_str() {
+                    "BULL" => 1.20,
+                    "DEFENSIVE" => 0.85,
+                    "CRASH" => 0.45,
+                    _ => 1.0,
+                }
+            };
+
+            let holdings = if options.use_momentum_rotation {
+                select_holdings(assets, idx, &regime, exposure)
+            } else {
+                let weight = exposure / assets.len() as f64;
+                assets
+                    .iter()
+                    .map(|a| Holding {
+                        symbol: a.symbol.clone(),
+                        weight,
+                    })
+                    .collect()
+            };
+
+            rebalance(
+                &mut state,
+                &holdings,
+                &prices,
+                current_equity,
+                options.fee_bps,
+                options.slippage_bps,
+            );
         }
 
         let updated_equity = portfolio_equity(state.cash, &state.positions, &prices);
@@ -453,7 +521,7 @@ fn run_equal_weight(assets: &[AssetSeries]) -> PortfolioState {
                 })
                 .collect();
 
-            rebalance(&mut state, &holdings, &prices, current_equity);
+                rebalance(&mut state, &holdings, &prices, current_equity, 0.0, 0.0);
         }
 
         let updated_equity = portfolio_equity(state.cash, &state.positions, &prices);
@@ -561,6 +629,112 @@ fn main() {
     println!(
         "Goal: capture upside through cross-asset rotation while reducing drawdown during defensive and crash regimes."
     );
+
+    println!();
+    println!("=== ABLATION STUDY ===");
+
+    let ablation_options = vec![
+        RadmOptions {
+            name: "RADM_full".to_string(),
+            use_regime_filter: true,
+            use_drawdown_governor: true,
+            use_momentum_rotation: true,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+        },
+        RadmOptions {
+            name: "RADM_no_regime_filter".to_string(),
+            use_regime_filter: false,
+            use_drawdown_governor: true,
+            use_momentum_rotation: true,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+        },
+        RadmOptions {
+            name: "RADM_no_drawdown_governor".to_string(),
+            use_regime_filter: true,
+            use_drawdown_governor: false,
+            use_momentum_rotation: true,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+        },
+        RadmOptions {
+            name: "RADM_no_momentum_rotation".to_string(),
+            use_regime_filter: true,
+            use_drawdown_governor: true,
+            use_momentum_rotation: false,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+        },
+    ];
+
+    println!(
+        "{:<32} {:>10} {:>10} {:>10} {:>8}",
+        "Variant", "Return", "MaxDD", "Sharpe", "Trades"
+    );
+
+    for option in &ablation_options {
+        let state = run_radm_strategy_with_options(&assets, option);
+        let report = summarize(&option.name, &state);
+
+        println!(
+            "{:<32} {:>9.2}% {:>9.2}% {:>10.4} {:>8}",
+            report.name,
+            report.total_return_pct,
+            report.max_drawdown_pct,
+            report.sharpe,
+            report.trades
+        );
+    }
+
+    println!();
+    println!("=== TRANSACTION COST STRESS TEST ===");
+
+    let cost_options = vec![
+        RadmOptions {
+            name: "RADM_cost_0bps".to_string(),
+            use_regime_filter: true,
+            use_drawdown_governor: true,
+            use_momentum_rotation: true,
+            fee_bps: 0.0,
+            slippage_bps: 0.0,
+        },
+        RadmOptions {
+            name: "RADM_cost_5bps".to_string(),
+            use_regime_filter: true,
+            use_drawdown_governor: true,
+            use_momentum_rotation: true,
+            fee_bps: 2.5,
+            slippage_bps: 2.5,
+        },
+        RadmOptions {
+            name: "RADM_cost_10bps".to_string(),
+            use_regime_filter: true,
+            use_drawdown_governor: true,
+            use_momentum_rotation: true,
+            fee_bps: 5.0,
+            slippage_bps: 5.0,
+        },
+    ];
+
+    println!(
+        "{:<32} {:>10} {:>10} {:>10} {:>8}",
+        "Scenario", "Return", "MaxDD", "Sharpe", "Trades"
+    );
+
+    for option in &cost_options {
+        let state = run_radm_strategy_with_options(&assets, option);
+        let report = summarize(&option.name, &state);
+
+        println!(
+            "{:<32} {:>9.2}% {:>9.2}% {:>10.4} {:>8}",
+            report.name,
+            report.total_return_pct,
+            report.max_drawdown_pct,
+            report.sharpe,
+            report.trades
+        );
+    }
 
     println!();
     println!("=== RESEARCH GATE ===");
