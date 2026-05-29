@@ -32,6 +32,20 @@ struct StrategyReport {
 }
 
 #[derive(Debug, Clone)]
+struct WalkForwardResult {
+    window: usize,
+    strategy_return: f64,
+    equal_weight_return: f64,
+    spy_return: f64,
+    strategy_dd: f64,
+    equal_weight_dd: f64,
+    spy_dd: f64,
+    strategy_sharpe: f64,
+    equal_weight_sharpe: f64,
+    spy_sharpe: f64,
+}
+
+#[derive(Debug, Clone)]
 struct Holding {
     symbol: String,
     weight: f64,
@@ -219,6 +233,159 @@ fn summarize(name: &str, state: &PortfolioState) -> StrategyReport {
         sharpe,
         trades: state.trades,
     }
+}
+
+fn slice_assets(assets: &[AssetSeries], start: usize, end: usize) -> Vec<AssetSeries> {
+    assets
+        .iter()
+        .map(|asset| AssetSeries {
+            symbol: asset.symbol.clone(),
+            bars: asset.bars[start..end].to_vec(),
+        })
+        .collect()
+}
+
+fn run_walk_forward_validation(assets: &[AssetSeries]) -> Vec<WalkForwardResult> {
+    let len = aligned_len(assets);
+
+    let window_size = 504;
+    let step_size = 252;
+    let min_start = 0;
+
+    let mut results = Vec::new();
+    let mut window = 1;
+    let mut start = min_start;
+
+    while start + window_size <= len {
+        let end = start + window_size;
+        let sliced_assets = slice_assets(assets, start, end);
+
+        let strategy_state = run_radm_strategy(&sliced_assets);
+        let equal_state = run_equal_weight(&sliced_assets);
+        let spy_state = run_spy_buy_hold(&sliced_assets);
+
+        let strategy_report = summarize("RADM", &strategy_state);
+        let equal_report = summarize("Equal", &equal_state);
+        let spy_report = summarize("SPY", &spy_state);
+
+        results.push(WalkForwardResult {
+            window,
+            strategy_return: strategy_report.total_return_pct,
+            equal_weight_return: equal_report.total_return_pct,
+            spy_return: spy_report.total_return_pct,
+            strategy_dd: strategy_report.max_drawdown_pct,
+            equal_weight_dd: equal_report.max_drawdown_pct,
+            spy_dd: spy_report.max_drawdown_pct,
+            strategy_sharpe: strategy_report.sharpe,
+            equal_weight_sharpe: equal_report.sharpe,
+            spy_sharpe: spy_report.sharpe,
+        });
+
+        window += 1;
+        start += step_size;
+    }
+
+    results
+}
+
+fn print_walk_forward_results(results: &[WalkForwardResult]) {
+    println!();
+    println!("=== RADM WALK-FORWARD VALIDATION ===");
+
+    if results.is_empty() {
+        println!("No walk-forward windows available.");
+        return;
+    }
+
+    println!(
+        "{:<8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Window", "RADM_R", "EQ_R", "SPY_R", "RADM_DD", "EQ_DD", "SPY_DD", "RADM_S"
+    );
+
+    let mut positive_windows = 0;
+    let mut beat_equal_return = 0;
+    let mut beat_spy_return = 0;
+    let mut lower_spy_dd = 0;
+
+    let mut avg_strategy_return = 0.0;
+    let mut avg_equal_return = 0.0;
+    let mut avg_spy_return = 0.0;
+    let mut avg_strategy_dd = 0.0;
+    let mut avg_spy_dd = 0.0;
+    let mut avg_strategy_sharpe = 0.0;
+
+    for r in results {
+        if r.strategy_return > 0.0 {
+            positive_windows += 1;
+        }
+        if r.strategy_return > r.equal_weight_return {
+            beat_equal_return += 1;
+        }
+        if r.strategy_return > r.spy_return {
+            beat_spy_return += 1;
+        }
+        if r.strategy_dd < r.spy_dd {
+            lower_spy_dd += 1;
+        }
+
+        avg_strategy_return += r.strategy_return;
+        avg_equal_return += r.equal_weight_return;
+        avg_spy_return += r.spy_return;
+        avg_strategy_dd += r.strategy_dd;
+        avg_spy_dd += r.spy_dd;
+        avg_strategy_sharpe += r.strategy_sharpe;
+
+        println!(
+            "{:<8} {:>9.2}% {:>9.2}% {:>9.2}% {:>9.2}% {:>9.2}% {:>9.2}% {:>10.4}",
+            r.window,
+            r.strategy_return,
+            r.equal_weight_return,
+            r.spy_return,
+            r.strategy_dd,
+            r.equal_weight_dd,
+            r.spy_dd,
+            r.strategy_sharpe
+        );
+    }
+
+    let n = results.len() as f64;
+
+    avg_strategy_return /= n;
+    avg_equal_return /= n;
+    avg_spy_return /= n;
+    avg_strategy_dd /= n;
+    avg_spy_dd /= n;
+    avg_strategy_sharpe /= n;
+
+    println!();
+    println!("=== RADM WALK-FORWARD SUMMARY ===");
+    println!("Windows: {}", results.len());
+    println!("Average RADM Return: {:.4}%", avg_strategy_return);
+    println!("Average Equal-Weight Return: {:.4}%", avg_equal_return);
+    println!("Average SPY Return: {:.4}%", avg_spy_return);
+    println!("Average RADM Max Drawdown: {:.4}%", avg_strategy_dd);
+    println!("Average SPY Max Drawdown: {:.4}%", avg_spy_dd);
+    println!("Average RADM Sharpe: {:.4}", avg_strategy_sharpe);
+    println!(
+        "Positive RADM Windows: {}/{}",
+        positive_windows,
+        results.len()
+    );
+    println!(
+        "RADM Beats Equal-Weight Return Windows: {}/{}",
+        beat_equal_return,
+        results.len()
+    );
+    println!(
+        "RADM Beats SPY Return Windows: {}/{}",
+        beat_spy_return,
+        results.len()
+    );
+    println!(
+        "RADM Lower Drawdown Than SPY Windows: {}/{}",
+        lower_spy_dd,
+        results.len()
+    );
 }
 
 fn print_report(report: &StrategyReport) {
@@ -785,4 +952,8 @@ fn main() {
     } else {
         println!("RESEARCH_GATE: REVIEW");
     }
+
+    let walk_forward_results = run_walk_forward_validation(&assets);
+    print_walk_forward_results(&walk_forward_results);
+
 }
