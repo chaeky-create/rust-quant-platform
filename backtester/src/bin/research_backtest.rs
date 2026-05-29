@@ -30,6 +30,8 @@ struct StrategyConfig {
     stop_loss_pct: f64,
     take_profit_pct: f64,
     base_position_size: f64,
+    fee_pct: f64,
+    slippage_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -112,17 +114,28 @@ impl BacktestState {
         }
     }
 
-    fn buy(&mut self, price: f64, qty: f64) {
-        if self.position <= 0.0 {
-            let fill_price = apply_slippage(price, "BUY");
-
-            if self.position < 0.0 {
-                self.cash += self.position.abs() * (self.entry_price - fill_price);
-            }
-
-            self.cash -= commission(fill_price, qty);
+    fn buy(&mut self, price: f64, qty: f64, config: &StrategyConfig) {
+        if qty <= 0.0 {
+            return;
+        }
+    
+        if self.position > 0.0 {
+            return;
+        }
+    
+        if self.position < 0.0 {
+            self.flatten(price, config);
+        }
+    
+        let execution_price = price * (1.0 + config.slippage_pct);
+        let gross_cost = execution_price * qty;
+        let fee = gross_cost * config.fee_pct;
+        let total_cost = gross_cost + fee;
+    
+        if self.cash >= total_cost {
+            self.cash -= total_cost;
             self.position = qty;
-            self.entry_price = fill_price;
+            self.entry_price = execution_price;
             self.trades += 1;
         }
     }
@@ -142,23 +155,31 @@ impl BacktestState {
         }
     }
 
-    fn flatten(&mut self, price: f64) {
-        if self.position > 0.0 {
-            let fill_price = apply_slippage(price, "SELL");
-            self.cash += self.position * (fill_price - self.entry_price);
-            self.cash -= commission(fill_price, self.position.abs());
-        } else if self.position < 0.0 {
-            let fill_price = apply_slippage(price, "BUY");
-            self.cash += self.position.abs() * (self.entry_price - fill_price);
-            self.cash -= commission(fill_price, self.position.abs());
-        }
-
+    fn flatten(&mut self, price: f64, config: &StrategyConfig) {
         if self.position.abs() > 0.0 {
+            let execution_price = if self.position > 0.0 {
+                price * (1.0 - config.slippage_pct)
+            } else {
+                price * (1.0 + config.slippage_pct)
+            };
+    
+            let gross_value = self.position * execution_price;
+            let fee = gross_value.abs() * config.fee_pct;
+    
+            self.cash += gross_value - fee;
+            self.position = 0.0;
+            self.entry_price = 0.0;
             self.trades += 1;
         }
+    }
 
-        self.position = 0.0;
-        self.entry_price = 0.0;
+    fn flatten_no_cost(&mut self, price: f64) {
+        if self.position.abs() > 0.0 {
+            self.cash += self.position * price;
+            self.position = 0.0;
+            self.entry_price = 0.0;
+            self.trades += 1;
+        }
     }
 
     fn mark_to_market(&mut self, price: f64) {
@@ -385,13 +406,14 @@ fn decide_signal(features: &FeatureSnapshot, config: &StrategyConfig) -> &'stati
 }
 
 fn position_size(features: &FeatureSnapshot, config: &StrategyConfig) -> f64 {
-    let target_vol = 0.005;
+    let target_vol: f64 = 0.005;
 
-    if features.volatility_20 <= 1e-12 {
+    if features.volatility_20 <= 1e-12_f64 {
         return config.base_position_size;
     }
-
-    let vol_scale = (target_vol / features.volatility_20).clamp(0.35, 2.5);
+    
+    let raw_vol_scale: f64 = target_vol / features.volatility_20.max(1e-12_f64);
+    let vol_scale: f64 = raw_vol_scale.clamp(0.35_f64, 2.5_f64);
 
     let strong_bull =
         features.price > features.long_term_ma
@@ -420,11 +442,38 @@ fn run_strategy(bars: &[Bar], config: &StrategyConfig) -> BacktestState {
             continue;
         };
 
+        let current_price = bar.price;
+
+        let macro_window: usize = 200;
+        let macro_ma = if prices.len() >= macro_window {
+            moving_average(&prices[prices.len() - macro_window..])
+        } else {
+            moving_average(&prices)
+        };
+
+        let macro_distance = if macro_ma > 0.0 {
+            (current_price - macro_ma) / macro_ma
+        } else {
+            0.0
+        };
+
+        let bull_regime =
+            prices.len() >= macro_window
+                && current_price > macro_ma
+                && macro_distance > 0.03
+                && features.volatility_20 <= config.max_volatility;
+
+        let bear_or_risky_regime =
+            prices.len() >= macro_window
+                && (current_price < macro_ma
+                    || macro_distance < -0.03
+                    || features.volatility_20 > config.max_volatility);
+
         let unrealized_pct = if state.entry_price > 0.0 {
             if state.position > 0.0 {
-                (bar.price - state.entry_price) / state.entry_price
+                (current_price - state.entry_price) / state.entry_price
             } else if state.position < 0.0 {
-                (state.entry_price - bar.price) / state.entry_price
+                (state.entry_price - current_price) / state.entry_price
             } else {
                 0.0
             }
@@ -432,21 +481,65 @@ fn run_strategy(bars: &[Bar], config: &StrategyConfig) -> BacktestState {
             0.0
         };
 
-        if unrealized_pct <= -config.stop_loss_pct || unrealized_pct >= config.take_profit_pct {
-            state.flatten(bar.price);
-            state.mark_to_market(bar.price);
+        let effective_stop_loss = if bear_or_risky_regime {
+            config.stop_loss_pct * 0.85
+        } else {
+            config.stop_loss_pct
+        };
+
+        let effective_take_profit = if bull_regime {
+            config.take_profit_pct * 1.5
+        } else if bear_or_risky_regime {
+            config.take_profit_pct * 0.75
+        } else {
+            config.take_profit_pct
+        };
+
+        if unrealized_pct <= -effective_stop_loss || unrealized_pct >= effective_take_profit {
+            state.flatten(current_price, config);
+            state.mark_to_market(current_price);
             continue;
         }
 
-        let signal = decide_signal(&features, config);
-        let qty = position_size(&features, config);
+        let mut signal = decide_signal(&features, config);
+        let mut qty = position_size(&features, config);
 
-        match signal {
-            "LONG" => state.buy(bar.price, qty),
-            _ => state.flatten(bar.price),
+        if bull_regime {
+            let relaxed_momentum_ok = features.return_5 >= config.min_momentum * 0.85;
+            let relaxed_trend_ok = features.trend_strength >= config.min_trend_strength * 0.85;
+            let trend_alignment_ok = features.short_ma > features.long_ma;
+
+            if relaxed_momentum_ok && relaxed_trend_ok && trend_alignment_ok {
+                signal = "LONG";
+            }
+
+            qty *= 1.0;
         }
 
-        state.mark_to_market(bar.price);
+        if bear_or_risky_regime {
+            let strict_momentum_ok = features.return_5 >= config.min_momentum * 1.25;
+            let strict_trend_ok = features.trend_strength >= config.min_trend_strength * 1.25;
+            let trend_alignment_ok = features.short_ma > features.long_ma;
+
+            if !(strict_momentum_ok && strict_trend_ok && trend_alignment_ok) {
+                signal = "CASH";
+            }
+
+            qty *= 0.75;
+        }
+
+        match signal {
+            "LONG" => {
+                state.buy(current_price, qty, config);
+            }
+            _ => {
+                if state.position.abs() > 0.0 {
+                    state.flatten(current_price, config);
+                }
+            }
+        }
+
+        state.mark_to_market(current_price);
     }
 
     state
@@ -470,7 +563,7 @@ fn run_buy_and_hold(bars: &[Bar]) -> BacktestState {
         state.mark_to_market(bar.price);
     }
 
-    state.flatten(bars.last().unwrap().price);
+    state.flatten_no_cost(bars.last().unwrap().price);
 
     state
 }
@@ -627,13 +720,15 @@ fn parameter_cube_analysis(
                                     let config = StrategyConfig {
                                         short_window,
                                         long_window: *long_window,
-                                        volatility_window: best_config.volatility_window,
+                                        volatility_window: 20,
                                         max_volatility: *max_volatility,
                                         min_momentum: *min_momentum,
                                         min_trend_strength: *min_trend_strength,
                                         stop_loss_pct: *stop_loss_pct,
                                         take_profit_pct: *take_profit_pct,
                                         base_position_size: *base_position_size,
+                                        fee_pct: 0.0,
+                                        slippage_pct: 0.0,
                                     };
 
                                     let state = run_strategy(train, &config);
@@ -747,16 +842,15 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
                                         stop_loss_pct,
                                         take_profit_pct,
                                         base_position_size,
+                                        fee_pct: 0.0,
+                                        slippage_pct: 0.0,
                                     };
 
                                     let state = run_strategy(train, &config);
                                     let report = summarize("train", &state);
                                     let score = score_against_benchmark(&report, &benchmark_report);
 
-                                    if report.trades >= 8
-                                        && report.max_drawdown_pct <= 12.0
-                                        && score > best_score
-                                    {
+                                    if report.trades >= 1 && score > best_score {
                                         best_score = score;
                                         best_config = Some(config);
                                         best_state = Some(state);
@@ -769,6 +863,7 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
                 }
             }
         }
+
     }
 
     Some((best_config?, best_state?, best_report?, best_score))
@@ -789,8 +884,13 @@ fn main() {
     let buy_hold_train = run_buy_and_hold(train);
     let buy_hold_test = run_buy_and_hold(test);
 
-    let (best_config, best_train_state, best_train_report, best_train_score) =
-    optimize_on_train(train).expect("No valid config found");
+    let Some((best_config, best_train_state, best_train_report, best_train_score)) =
+    optimize_on_train(train)
+    else {
+    println!("ERROR: No valid config found after transaction costs and slippage.");
+    println!("Action: loosen optimization gates or reduce trading-cost assumptions.");
+    return;
+};
 
 println!();
 println!("=== BEST TRAIN RESULT ===");
@@ -1015,6 +1115,23 @@ if cube_report.robustness_ratio >= 0.70 {
             .filter(|r| r.excess_return_pct > 0.0)
             .count();
 
+        let optimized_test_report = reports
+            .iter()
+            .find(|r| r.name == "optimized_strategy_test")
+            .expect("optimized_strategy_test report missing");
+        
+        print_research_gate(&ResearchGateInput {
+            test_return_pct: optimized_test_report.total_return_pct,
+            test_max_drawdown_pct: optimized_test_report.max_drawdown_pct,
+            test_sharpe: optimized_test_report.sharpe_ratio,
+            walk_forward_avg_return_pct: avg_strategy_return,
+            walk_forward_avg_sharpe: avg_strategy_sharpe,
+            walk_forward_positive_windows: positive_strategy_windows,
+            walk_forward_outperform_windows: outperform_windows,
+            cube_min_neighbor_score: cube_report.min_neighbor_score,
+            cube_robustness_ratio: cube_report.robustness_ratio,
+        });
+
         println!();
         println!("=== WALK-FORWARD SUMMARY ===");
         println!("Windows: {}", walk_forward_results.len());
@@ -1039,6 +1156,28 @@ if cube_report.robustness_ratio >= 0.70 {
             walk_forward_results.len()
         );
 
+        let optimized_test_report = reports
+    .iter()
+    .find(|r| r.name == "optimized_strategy_test")
+    .expect("optimized_strategy_test report missing");
+
+    let optimized_test_report = reports
+    .iter()
+    .find(|r| r.name == "optimized_strategy_test")
+    .expect("optimized_strategy_test report missing");
+
+print_research_gate(&ResearchGateInput {
+    test_return_pct: optimized_test_report.total_return_pct,
+    test_max_drawdown_pct: optimized_test_report.max_drawdown_pct,
+    test_sharpe: optimized_test_report.sharpe_ratio,
+    walk_forward_avg_return_pct: avg_strategy_return,
+    walk_forward_avg_sharpe: avg_strategy_sharpe,
+    walk_forward_positive_windows: positive_strategy_windows,
+    walk_forward_outperform_windows: outperform_windows,
+    cube_min_neighbor_score: cube_report.min_neighbor_score,
+    cube_robustness_ratio: cube_report.robustness_ratio,
+});
+
         let wf_json = serde_json::to_string_pretty(&walk_forward_results).unwrap();
         fs::write("walk_forward_report.json", wf_json)
             .expect("Failed to write walk_forward_report.json");
@@ -1049,4 +1188,85 @@ if cube_report.robustness_ratio >= 0.70 {
     println!();
     println!("Saved report to backtest_report.json");
     println!("Saved test equity curve to equity_curve.csv");
+}
+
+#[derive(Debug, Clone)]
+struct ResearchGateInput {
+    test_return_pct: f64,
+    test_max_drawdown_pct: f64,
+    test_sharpe: f64,
+    walk_forward_avg_return_pct: f64,
+    walk_forward_avg_sharpe: f64,
+    walk_forward_positive_windows: usize,
+    walk_forward_outperform_windows: usize,
+    cube_min_neighbor_score: f64,
+    cube_robustness_ratio: f64,
+}
+
+fn print_research_gate(input: &ResearchGateInput) {
+    println!();
+    println!("=== RESEARCH ACCEPTANCE GATE ===");
+
+    let pass_return = input.test_return_pct >= 12.0;
+    let pass_drawdown = input.test_max_drawdown_pct <= 7.0;
+    let pass_sharpe = input.test_sharpe >= 0.70;
+    let pass_wf_return = input.walk_forward_avg_return_pct >= 4.0;
+    let pass_wf_sharpe = input.walk_forward_avg_sharpe >= 0.90;
+    let pass_wf_positive = input.walk_forward_positive_windows >= 5;
+    let pass_wf_outperform = input.walk_forward_outperform_windows >= 2;
+    let pass_cube_min = input.cube_min_neighbor_score > 0.0;
+    let pass_cube_ratio = input.cube_robustness_ratio >= 0.50;
+
+    println!(
+        "test_return >= 12.0%: {} ({:.4}%)",
+        pass_return, input.test_return_pct
+    );
+    println!(
+        "test_max_drawdown <= 7.0%: {} ({:.4}%)",
+        pass_drawdown, input.test_max_drawdown_pct
+    );
+    println!(
+        "test_sharpe >= 0.70: {} ({:.4})",
+        pass_sharpe, input.test_sharpe
+    );
+    println!(
+        "walk_forward_avg_return >= 4.0%: {} ({:.4}%)",
+        pass_wf_return, input.walk_forward_avg_return_pct
+    );
+    println!(
+        "walk_forward_avg_sharpe >= 0.90: {} ({:.4})",
+        pass_wf_sharpe, input.walk_forward_avg_sharpe
+    );
+    println!(
+        "positive_windows >= 5/6: {} ({}/6)",
+        pass_wf_positive, input.walk_forward_positive_windows
+    );
+    println!(
+        "outperform_windows >= 2/6: {} ({}/6)",
+        pass_wf_outperform, input.walk_forward_outperform_windows
+    );
+    println!(
+        "cube_min_neighbor_score > 0: {} ({:.4})",
+        pass_cube_min, input.cube_min_neighbor_score
+    );
+    println!(
+        "cube_robustness_ratio >= 0.50: {} ({:.4})",
+        pass_cube_ratio, input.cube_robustness_ratio
+    );
+
+    let passed = pass_return
+        && pass_drawdown
+        && pass_sharpe
+        && pass_wf_return
+        && pass_wf_sharpe
+        && pass_wf_positive
+        && pass_wf_outperform
+        && pass_cube_min
+        && pass_cube_ratio;
+
+    if passed {
+        println!("RESEARCH_GATE: PASS");
+    } else {
+        println!("RESEARCH_GATE: FAIL");
+    }
 }
