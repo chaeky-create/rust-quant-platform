@@ -585,7 +585,7 @@ fn main() {
         lower_dd_than_spy, strategy_report.max_drawdown_pct, spy_report.max_drawdown_pct
     );
     println!(
-        "drawdown < equal_weight: {} ({:.2}% vs {:.2}%)",
+        "drawdown <= equal_weight + 2%: {} ({:.2}% vs {:.2}%)",
         dd_close_to_equal,
         strategy_report.max_drawdown_pct,
         equal_weight_report.max_drawdown_pct
