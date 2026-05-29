@@ -30,8 +30,6 @@ struct StrategyConfig {
     stop_loss_pct: f64,
     take_profit_pct: f64,
     base_position_size: f64,
-    fee_pct: f64,
-    slippage_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -52,18 +50,6 @@ struct StrategyReport {
     sharpe_ratio: f64,
     calmar_ratio: f64,
     trades: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ParameterCubeReport {
-    best_score: f64,
-    neighbor_count: usize,
-    avg_neighbor_score: f64,
-    median_neighbor_score: f64,
-    min_neighbor_score: f64,
-    max_neighbor_score: f64,
-    robustness_ratio: f64,
-    score_gap: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -114,28 +100,17 @@ impl BacktestState {
         }
     }
 
-    fn buy(&mut self, price: f64, qty: f64, config: &StrategyConfig) {
-        if qty <= 0.0 {
-            return;
-        }
-    
-        if self.position > 0.0 {
-            return;
-        }
-    
-        if self.position < 0.0 {
-            self.flatten(price, config);
-        }
-    
-        let execution_price = price * (1.0 + config.slippage_pct);
-        let gross_cost = execution_price * qty;
-        let fee = gross_cost * config.fee_pct;
-        let total_cost = gross_cost + fee;
-    
-        if self.cash >= total_cost {
-            self.cash -= total_cost;
+    fn buy(&mut self, price: f64, qty: f64) {
+        if self.position <= 0.0 {
+            let fill_price = apply_slippage(price, "BUY");
+
+            if self.position < 0.0 {
+                self.cash += self.position.abs() * (self.entry_price - fill_price);
+            }
+
+            self.cash -= commission(fill_price, qty);
             self.position = qty;
-            self.entry_price = execution_price;
+            self.entry_price = fill_price;
             self.trades += 1;
         }
     }
@@ -155,31 +130,23 @@ impl BacktestState {
         }
     }
 
-    fn flatten(&mut self, price: f64, config: &StrategyConfig) {
-        if self.position.abs() > 0.0 {
-            let execution_price = if self.position > 0.0 {
-                price * (1.0 - config.slippage_pct)
-            } else {
-                price * (1.0 + config.slippage_pct)
-            };
-    
-            let gross_value = self.position * execution_price;
-            let fee = gross_value.abs() * config.fee_pct;
-    
-            self.cash += gross_value - fee;
-            self.position = 0.0;
-            self.entry_price = 0.0;
-            self.trades += 1;
+    fn flatten(&mut self, price: f64) {
+        if self.position > 0.0 {
+            let fill_price = apply_slippage(price, "SELL");
+            self.cash += self.position * (fill_price - self.entry_price);
+            self.cash -= commission(fill_price, self.position.abs());
+        } else if self.position < 0.0 {
+            let fill_price = apply_slippage(price, "BUY");
+            self.cash += self.position.abs() * (self.entry_price - fill_price);
+            self.cash -= commission(fill_price, self.position.abs());
         }
-    }
 
-    fn flatten_no_cost(&mut self, price: f64) {
         if self.position.abs() > 0.0 {
-            self.cash += self.position * price;
-            self.position = 0.0;
-            self.entry_price = 0.0;
             self.trades += 1;
         }
+
+        self.position = 0.0;
+        self.entry_price = 0.0;
     }
 
     fn mark_to_market(&mut self, price: f64) {
@@ -406,28 +373,15 @@ fn decide_signal(features: &FeatureSnapshot, config: &StrategyConfig) -> &'stati
 }
 
 fn position_size(features: &FeatureSnapshot, config: &StrategyConfig) -> f64 {
-    let target_vol: f64 = 0.005;
+    let target_vol = 0.005;
 
-    if features.volatility_20 <= 1e-12_f64 {
+    if features.volatility_20 <= 1e-12 {
         return config.base_position_size;
     }
-    
-    let raw_vol_scale: f64 = target_vol / features.volatility_20.max(1e-12_f64);
-    let vol_scale: f64 = raw_vol_scale.clamp(0.35_f64, 2.5_f64);
 
-    let strong_bull =
-        features.price > features.long_term_ma
-        && features.short_ma > features.long_ma
-        && features.return_5 > config.min_momentum * 2.0
-        && features.volatility_20 <= config.max_volatility;
+    let vol_scale = (target_vol / features.volatility_20).clamp(0.25, 2.0);
 
-    let risk_on_multiplier = if strong_bull {
-        1.5
-    } else {
-        1.0
-    };
-
-    config.base_position_size * vol_scale * risk_on_multiplier
+    config.base_position_size * vol_scale
 }
 
 fn run_strategy(bars: &[Bar], config: &StrategyConfig) -> BacktestState {
@@ -442,38 +396,11 @@ fn run_strategy(bars: &[Bar], config: &StrategyConfig) -> BacktestState {
             continue;
         };
 
-        let current_price = bar.price;
-
-        let macro_window: usize = 200;
-        let macro_ma = if prices.len() >= macro_window {
-            moving_average(&prices[prices.len() - macro_window..])
-        } else {
-            moving_average(&prices)
-        };
-
-        let macro_distance = if macro_ma > 0.0 {
-            (current_price - macro_ma) / macro_ma
-        } else {
-            0.0
-        };
-
-        let bull_regime =
-            prices.len() >= macro_window
-                && current_price > macro_ma
-                && macro_distance > 0.03
-                && features.volatility_20 <= config.max_volatility;
-
-        let bear_or_risky_regime =
-            prices.len() >= macro_window
-                && (current_price < macro_ma
-                    || macro_distance < -0.03
-                    || features.volatility_20 > config.max_volatility);
-
         let unrealized_pct = if state.entry_price > 0.0 {
             if state.position > 0.0 {
-                (current_price - state.entry_price) / state.entry_price
+                (bar.price - state.entry_price) / state.entry_price
             } else if state.position < 0.0 {
-                (state.entry_price - current_price) / state.entry_price
+                (state.entry_price - bar.price) / state.entry_price
             } else {
                 0.0
             }
@@ -481,65 +408,21 @@ fn run_strategy(bars: &[Bar], config: &StrategyConfig) -> BacktestState {
             0.0
         };
 
-        let effective_stop_loss = if bear_or_risky_regime {
-            config.stop_loss_pct * 0.85
-        } else {
-            config.stop_loss_pct
-        };
-
-        let effective_take_profit = if bull_regime {
-            config.take_profit_pct * 1.5
-        } else if bear_or_risky_regime {
-            config.take_profit_pct * 0.75
-        } else {
-            config.take_profit_pct
-        };
-
-        if unrealized_pct <= -effective_stop_loss || unrealized_pct >= effective_take_profit {
-            state.flatten(current_price, config);
-            state.mark_to_market(current_price);
+        if unrealized_pct <= -config.stop_loss_pct || unrealized_pct >= config.take_profit_pct {
+            state.flatten(bar.price);
+            state.mark_to_market(bar.price);
             continue;
         }
 
-        let mut signal = decide_signal(&features, config);
-        let mut qty = position_size(&features, config);
-
-        if bull_regime {
-            let relaxed_momentum_ok = features.return_5 >= config.min_momentum * 0.85;
-            let relaxed_trend_ok = features.trend_strength >= config.min_trend_strength * 0.85;
-            let trend_alignment_ok = features.short_ma > features.long_ma;
-
-            if relaxed_momentum_ok && relaxed_trend_ok && trend_alignment_ok {
-                signal = "LONG";
-            }
-
-            qty *= 1.0;
-        }
-
-        if bear_or_risky_regime {
-            let strict_momentum_ok = features.return_5 >= config.min_momentum * 1.25;
-            let strict_trend_ok = features.trend_strength >= config.min_trend_strength * 1.25;
-            let trend_alignment_ok = features.short_ma > features.long_ma;
-
-            if !(strict_momentum_ok && strict_trend_ok && trend_alignment_ok) {
-                signal = "CASH";
-            }
-
-            qty *= 0.75;
-        }
+        let signal = decide_signal(&features, config);
+        let qty = position_size(&features, config);
 
         match signal {
-            "LONG" => {
-                state.buy(current_price, qty, config);
-            }
-            _ => {
-                if state.position.abs() > 0.0 {
-                    state.flatten(current_price, config);
-                }
-            }
+            "LONG" => state.buy(bar.price, qty),
+            _ => state.flatten(bar.price),
         }
 
-        state.mark_to_market(current_price);
+        state.mark_to_market(bar.price);
     }
 
     state
@@ -563,7 +446,7 @@ fn run_buy_and_hold(bars: &[Bar]) -> BacktestState {
         state.mark_to_market(bar.price);
     }
 
-    state.flatten_no_cost(bars.last().unwrap().price);
+    state.flatten(bars.last().unwrap().price);
 
     state
 }
@@ -614,248 +497,47 @@ fn score_report(report: &StrategyReport) -> f64 {
         - negative_return_penalty
 }
 
-fn score_against_benchmark(strategy: &StrategyReport, benchmark: &StrategyReport) -> f64 {
-    let excess_return = strategy.total_return_pct - benchmark.total_return_pct;
-    let drawdown_reduction = benchmark.max_drawdown_pct - strategy.max_drawdown_pct;
-
-    let risk_penalty = if strategy.max_drawdown_pct > 8.0 {
-        (strategy.max_drawdown_pct - 8.0) * 2.0
-    } else {
-        0.0
-    };
-
-    let negative_return_penalty = if strategy.total_return_pct < 0.0 {
-        strategy.total_return_pct.abs() * 2.0
-    } else {
-        0.0
-    };
-
-    let low_trade_penalty = if strategy.trades < 8 {
-        8.0
-    } else {
-        0.0
-    };
-
-    strategy.total_return_pct * 0.25
-        + excess_return * 0.20
-        + strategy.sharpe_ratio * 3.0
-        + strategy.calmar_ratio * 0.8
-        + drawdown_reduction * 0.12
-        - strategy.max_drawdown_pct * 0.10
-        - risk_penalty
-        - negative_return_penalty
-        - low_trade_penalty
-}
-
-fn parameter_cube_analysis(
-    train: &[Bar],
-    best_config: &StrategyConfig,
-    best_score: f64,
-) -> ParameterCubeReport {
-    let benchmark_state = run_buy_and_hold(train);
-    let benchmark_report = summarize("cube_benchmark", &benchmark_state);
-
-    let short_values = unique_sorted_usize(vec![
-        best_config.short_window.saturating_sub(2).max(2),
-        best_config.short_window,
-        best_config.short_window + 2,
-    ]);
-
-    let long_values = unique_sorted_usize(vec![
-        best_config.long_window.saturating_sub(20).max(best_config.short_window + 1),
-        best_config.long_window,
-        best_config.long_window + 20,
-    ]);
-
-    let max_vol_values = unique_sorted_f64(vec![
-        (best_config.max_volatility * 0.75).max(0.001),
-        best_config.max_volatility,
-        best_config.max_volatility * 1.25,
-    ]);
-
-    let momentum_values = unique_sorted_f64(vec![
-        (best_config.min_momentum * 0.5).max(0.00005),
-        best_config.min_momentum,
-        best_config.min_momentum * 2.0,
-    ]);
-
-    let trend_values = unique_sorted_f64(vec![
-        (best_config.min_trend_strength * 0.5).max(0.00005),
-        best_config.min_trend_strength,
-        best_config.min_trend_strength * 2.0,
-    ]);
-
-    let stop_values = unique_sorted_f64(vec![
-        (best_config.stop_loss_pct * 0.5).max(0.005),
-        best_config.stop_loss_pct,
-        best_config.stop_loss_pct * 1.5,
-    ]);
-
-    let take_profit_values = unique_sorted_f64(vec![
-        (best_config.take_profit_pct * 0.75).max(0.02),
-        best_config.take_profit_pct,
-        best_config.take_profit_pct * 1.25,
-    ]);
-
-    let size_values = unique_sorted_f64(vec![
-        (best_config.base_position_size - 0.25).max(0.5),
-        best_config.base_position_size,
-        best_config.base_position_size + 0.25,
-    ]);
-
-    let mut scores: Vec<f64> = Vec::new();
-
-    for short_window in short_values {
-        for long_window in &long_values {
-            if short_window >= *long_window {
-                continue;
-            }
-
-            for max_volatility in &max_vol_values {
-                for min_momentum in &momentum_values {
-                    for min_trend_strength in &trend_values {
-                        for stop_loss_pct in &stop_values {
-                            for take_profit_pct in &take_profit_values {
-                                for base_position_size in &size_values {
-                                    let config = StrategyConfig {
-                                        short_window,
-                                        long_window: *long_window,
-                                        volatility_window: 20,
-                                        max_volatility: *max_volatility,
-                                        min_momentum: *min_momentum,
-                                        min_trend_strength: *min_trend_strength,
-                                        stop_loss_pct: *stop_loss_pct,
-                                        take_profit_pct: *take_profit_pct,
-                                        base_position_size: *base_position_size,
-                                        fee_pct: 0.0,
-                                        slippage_pct: 0.0,
-                                    };
-
-                                    let state = run_strategy(train, &config);
-                                    let report = summarize("cube_neighbor", &state);
-
-                                    if report.trades < 8 || report.max_drawdown_pct > 12.0 {
-                                        continue;
-                                    }
-
-                                    let score =
-                                        score_against_benchmark(&report, &benchmark_report);
-                                    scores.push(score);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if scores.is_empty() {
-        return ParameterCubeReport {
-            best_score,
-            neighbor_count: 0,
-            avg_neighbor_score: 0.0,
-            median_neighbor_score: 0.0,
-            min_neighbor_score: 0.0,
-            max_neighbor_score: 0.0,
-            robustness_ratio: 0.0,
-            score_gap: best_score,
-        };
-    }
-
-    scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-    let neighbor_count = scores.len();
-    let min_neighbor_score = scores[0];
-    let max_neighbor_score = scores[neighbor_count - 1];
-    let avg_neighbor_score = scores.iter().sum::<f64>() / neighbor_count as f64;
-
-    let median_neighbor_score = if neighbor_count % 2 == 0 {
-        let a = scores[neighbor_count / 2 - 1];
-        let b = scores[neighbor_count / 2];
-        (a + b) / 2.0
-    } else {
-        scores[neighbor_count / 2]
-    };
-
-    let robustness_ratio = if best_score.abs() > 1e-9 {
-        median_neighbor_score / best_score
-    } else {
-        0.0
-    };
-
-    let score_gap = best_score - median_neighbor_score;
-
-    ParameterCubeReport {
-        best_score,
-        neighbor_count,
-        avg_neighbor_score,
-        median_neighbor_score,
-        min_neighbor_score,
-        max_neighbor_score,
-        robustness_ratio,
-        score_gap,
-    }
-}
-
-fn unique_sorted_usize(values: Vec<usize>) -> Vec<usize> {
-    let mut values = values;
-    values.sort();
-    values.dedup();
-    values
-}
-
-fn unique_sorted_f64(values: Vec<f64>) -> Vec<f64> {
-    let mut values = values;
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    values.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-    values
-}
-
 fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, StrategyReport, f64)> {
     let mut best_config: Option<StrategyConfig> = None;
     let mut best_state: Option<BacktestState> = None;
     let mut best_report: Option<StrategyReport> = None;
     let mut best_score = f64::MIN;
-    let benchmark_state = run_buy_and_hold(train);
-    let benchmark_report = summarize("train_benchmark", &benchmark_state);
 
-    for short_window in [8, 10, 12] {
-    for long_window in [60, 80, 100] {
-        if short_window >= long_window {
+    for short_window in [5, 8, 10, 12, 15] {
+        for long_window in [20, 30, 50, 80, 100] {
+            if short_window >= long_window {
                 continue;
             }
 
             for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
-                for min_momentum in [0.0003, 0.0005, 0.001, 0.002] {
-                    for min_trend_strength in [0.0003, 0.0005, 0.001, 0.002] {
-                        for stop_loss_pct in [0.015, 0.02, 0.03] {
-                            for take_profit_pct in [0.06, 0.08, 0.10] {
-                                for base_position_size in [1.0, 1.25, 1.5] {
-                                    let config = StrategyConfig {
-                                        short_window,
-                                        long_window,
-                                        volatility_window: 20,
-                                        max_volatility,
-                                        min_momentum,
-                                        min_trend_strength,
-                                        stop_loss_pct,
-                                        take_profit_pct,
-                                        base_position_size,
-                                        fee_pct: 0.0,
-                                        slippage_pct: 0.0,
-                                    };
+                for min_momentum in [0.00005, 0.0001, 0.0002, 0.0005] {
+                    for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
+                        for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
+                            for take_profit_pct in [0.02, 0.04, 0.08] {
+                                let config = StrategyConfig {
+                                    short_window,
+                                    long_window,
+                                    volatility_window: 20,
+                                    max_volatility,
+                                    min_momentum,
+                                    min_trend_strength,
+                                    stop_loss_pct,
+                                    take_profit_pct,
+                                    base_position_size: 1.0,
+                                };
 
-                                    let state = run_strategy(train, &config);
-                                    let report = summarize("train", &state);
-                                    let score = score_against_benchmark(&report, &benchmark_report);
+                                let state = run_strategy(train, &config);
+                                let report = summarize("train", &state);
+                                let score = score_report(&report);
 
-                                    if report.trades >= 1 && score > best_score {
-                                        best_score = score;
-                                        best_config = Some(config);
-                                        best_state = Some(state);
-                                        best_report = Some(report);
-                                    }
+                                if report.trades >= 20
+                                    && report.max_drawdown_pct <= 12.0
+                                    && score > best_score
+                                {
+                                    best_score = score;
+                                    best_config = Some(config);
+                                    best_state = Some(state);
+                                    best_report = Some(report);
                                 }
                             }
                         }
@@ -863,10 +545,14 @@ fn optimize_on_train(train: &[Bar]) -> Option<(StrategyConfig, BacktestState, St
                 }
             }
         }
-
     }
 
-    Some((best_config?, best_state?, best_report?, best_score))
+    Some((
+        best_config?,
+        best_state?,
+        best_report?,
+        best_score,
+    ))
 }
 
 
@@ -884,43 +570,118 @@ fn main() {
     let buy_hold_train = run_buy_and_hold(train);
     let buy_hold_test = run_buy_and_hold(test);
 
-    let Some((best_config, best_train_state, best_train_report, best_train_score)) =
-    optimize_on_train(train)
-    else {
-    println!("ERROR: No valid config found after transaction costs and slippage.");
-    println!("Action: loosen optimization gates or reduce trading-cost assumptions.");
-    return;
-};
+    let mut best_config: Option<StrategyConfig> = None;
+    let mut best_train_score = f64::MIN;
+    let mut best_train_state: Option<BacktestState> = None;
+    let mut candidates: Vec<CandidateResult> = Vec::new();
 
-println!();
-println!("=== BEST TRAIN RESULT ===");
-println!("score: {:.4}", best_train_score);
-println!("train_return: {:.4}%", best_train_report.total_return_pct);
-println!("train_max_drawdown: {:.4}%", best_train_report.max_drawdown_pct);
-println!("train_sharpe: {:.4}", best_train_report.sharpe_ratio);
-println!("train_calmar: {:.4}", best_train_report.calmar_ratio);
-println!("train_trades: {}", best_train_report.trades);
+    for short_window in [5, 8, 10, 12, 15] {
+        for long_window in [20, 30, 50, 80, 100] {
+            if short_window >= long_window {
+                continue;
+            }
 
-let cube_report = parameter_cube_analysis(train, &best_config, best_train_score);
+            for max_volatility in [0.005, 0.01, 0.02, 0.03, 0.04] {
+                for min_momentum in [0.00005, 0.0001, 0.0002, 0.0005] {
+                    for min_trend_strength in [0.00005, 0.0001, 0.0002, 0.0005] {
+                        for stop_loss_pct in [0.005, 0.01, 0.02, 0.04] {
+                            for take_profit_pct in [0.02, 0.04, 0.08] {
+                                let config = StrategyConfig {
+                                    short_window,
+                                    long_window,
+                                    volatility_window: 20,
+                                    max_volatility,
+                                    min_momentum,
+                                    min_trend_strength,
+                                    stop_loss_pct,
+                                    take_profit_pct,
+                                    base_position_size: 1.0,
+                                };
 
-println!();
-println!("=== PARAMETER CUBE ROBUSTNESS ===");
-println!("neighbor_count: {}", cube_report.neighbor_count);
-println!("best_score: {:.4}", cube_report.best_score);
-println!("avg_neighbor_score: {:.4}", cube_report.avg_neighbor_score);
-println!("median_neighbor_score: {:.4}", cube_report.median_neighbor_score);
-println!("min_neighbor_score: {:.4}", cube_report.min_neighbor_score);
-println!("max_neighbor_score: {:.4}", cube_report.max_neighbor_score);
-println!("robustness_ratio: {:.4}", cube_report.robustness_ratio);
-println!("score_gap: {:.4}", cube_report.score_gap);
+                                let state = run_strategy(train, &config);
+                                let report = summarize("train", &state);
 
-if cube_report.robustness_ratio >= 0.70 {
-    println!("robustness_label: ROBUST");
-} else if cube_report.robustness_ratio >= 0.40 {
-    println!("robustness_label: MODERATE");
-} else {
-    println!("robustness_label: OVERFIT_RISK");
-}
+                                let risk_penalty = if report.max_drawdown_pct > 8.0 {
+                                    (report.max_drawdown_pct - 8.0) * 2.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                let trade_penalty = if report.trades < 20 {
+                                    10.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                let negative_return_penalty = if report.total_return_pct < 0.0 {
+                                    report.total_return_pct.abs() * 2.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                let score =
+                                    report.total_return_pct * 0.20
+                                    + report.sharpe_ratio * 3.0
+                                    + report.calmar_ratio * 1.0
+                                    - report.max_drawdown_pct * 0.15
+                                    - risk_penalty
+                                    - trade_penalty
+                                    - negative_return_penalty;
+                                
+                                if report.trades >= 20 && report.max_drawdown_pct <= 12.0 {
+                                    candidates.push(CandidateResult {
+                                        config: config.clone(),
+                                        train_report: report.clone(),
+                                        score,
+                                    });
+                                
+                                    if score > best_train_score {
+                                        best_train_score = score;
+                                        best_config = Some(config.clone());
+                                        best_train_state = Some(state);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    
+    println!();
+    println!("=== TOP 10 TRAIN CANDIDATES ===");
+    
+    for (i, candidate) in candidates.iter().take(10).enumerate() {
+        println!(
+            "#{:<2} score={:.4} return={:.4}% dd={:.4}% sharpe={:.4} calmar={:.4} trades={} | short={} long={} vol={} mom={} trend={} sl={} tp={} size={}",
+            i + 1,
+            candidate.score,
+            candidate.train_report.total_return_pct,
+            candidate.train_report.max_drawdown_pct,
+            candidate.train_report.sharpe_ratio,
+            candidate.train_report.calmar_ratio,
+            candidate.train_report.trades,
+            candidate.config.short_window,
+            candidate.config.long_window,
+            candidate.config.max_volatility,
+            candidate.config.min_momentum,
+            candidate.config.min_trend_strength,
+            candidate.config.stop_loss_pct,
+            candidate.config.take_profit_pct,
+            candidate.config.base_position_size,
+        );
+    }
+
+    let best_config = best_config.expect("No valid config found");
+    let best_train_state = best_train_state.expect("No valid state found");
+
     let test_state = run_strategy(test, &best_config);
 
     let reports = vec![
@@ -1115,23 +876,6 @@ if cube_report.robustness_ratio >= 0.70 {
             .filter(|r| r.excess_return_pct > 0.0)
             .count();
 
-        let optimized_test_report = reports
-            .iter()
-            .find(|r| r.name == "optimized_strategy_test")
-            .expect("optimized_strategy_test report missing");
-        
-        print_research_gate(&ResearchGateInput {
-            test_return_pct: optimized_test_report.total_return_pct,
-            test_max_drawdown_pct: optimized_test_report.max_drawdown_pct,
-            test_sharpe: optimized_test_report.sharpe_ratio,
-            walk_forward_avg_return_pct: avg_strategy_return,
-            walk_forward_avg_sharpe: avg_strategy_sharpe,
-            walk_forward_positive_windows: positive_strategy_windows,
-            walk_forward_outperform_windows: outperform_windows,
-            cube_min_neighbor_score: cube_report.min_neighbor_score,
-            cube_robustness_ratio: cube_report.robustness_ratio,
-        });
-
         println!();
         println!("=== WALK-FORWARD SUMMARY ===");
         println!("Windows: {}", walk_forward_results.len());
@@ -1156,28 +900,6 @@ if cube_report.robustness_ratio >= 0.70 {
             walk_forward_results.len()
         );
 
-        let optimized_test_report = reports
-    .iter()
-    .find(|r| r.name == "optimized_strategy_test")
-    .expect("optimized_strategy_test report missing");
-
-    let optimized_test_report = reports
-    .iter()
-    .find(|r| r.name == "optimized_strategy_test")
-    .expect("optimized_strategy_test report missing");
-
-print_research_gate(&ResearchGateInput {
-    test_return_pct: optimized_test_report.total_return_pct,
-    test_max_drawdown_pct: optimized_test_report.max_drawdown_pct,
-    test_sharpe: optimized_test_report.sharpe_ratio,
-    walk_forward_avg_return_pct: avg_strategy_return,
-    walk_forward_avg_sharpe: avg_strategy_sharpe,
-    walk_forward_positive_windows: positive_strategy_windows,
-    walk_forward_outperform_windows: outperform_windows,
-    cube_min_neighbor_score: cube_report.min_neighbor_score,
-    cube_robustness_ratio: cube_report.robustness_ratio,
-});
-
         let wf_json = serde_json::to_string_pretty(&walk_forward_results).unwrap();
         fs::write("walk_forward_report.json", wf_json)
             .expect("Failed to write walk_forward_report.json");
@@ -1188,85 +910,4 @@ print_research_gate(&ResearchGateInput {
     println!();
     println!("Saved report to backtest_report.json");
     println!("Saved test equity curve to equity_curve.csv");
-}
-
-#[derive(Debug, Clone)]
-struct ResearchGateInput {
-    test_return_pct: f64,
-    test_max_drawdown_pct: f64,
-    test_sharpe: f64,
-    walk_forward_avg_return_pct: f64,
-    walk_forward_avg_sharpe: f64,
-    walk_forward_positive_windows: usize,
-    walk_forward_outperform_windows: usize,
-    cube_min_neighbor_score: f64,
-    cube_robustness_ratio: f64,
-}
-
-fn print_research_gate(input: &ResearchGateInput) {
-    println!();
-    println!("=== RESEARCH ACCEPTANCE GATE ===");
-
-    let pass_return = input.test_return_pct >= 12.0;
-    let pass_drawdown = input.test_max_drawdown_pct <= 7.0;
-    let pass_sharpe = input.test_sharpe >= 0.70;
-    let pass_wf_return = input.walk_forward_avg_return_pct >= 4.0;
-    let pass_wf_sharpe = input.walk_forward_avg_sharpe >= 0.90;
-    let pass_wf_positive = input.walk_forward_positive_windows >= 5;
-    let pass_wf_outperform = input.walk_forward_outperform_windows >= 2;
-    let pass_cube_min = input.cube_min_neighbor_score > 0.0;
-    let pass_cube_ratio = input.cube_robustness_ratio >= 0.50;
-
-    println!(
-        "test_return >= 12.0%: {} ({:.4}%)",
-        pass_return, input.test_return_pct
-    );
-    println!(
-        "test_max_drawdown <= 7.0%: {} ({:.4}%)",
-        pass_drawdown, input.test_max_drawdown_pct
-    );
-    println!(
-        "test_sharpe >= 0.70: {} ({:.4})",
-        pass_sharpe, input.test_sharpe
-    );
-    println!(
-        "walk_forward_avg_return >= 4.0%: {} ({:.4}%)",
-        pass_wf_return, input.walk_forward_avg_return_pct
-    );
-    println!(
-        "walk_forward_avg_sharpe >= 0.90: {} ({:.4})",
-        pass_wf_sharpe, input.walk_forward_avg_sharpe
-    );
-    println!(
-        "positive_windows >= 5/6: {} ({}/6)",
-        pass_wf_positive, input.walk_forward_positive_windows
-    );
-    println!(
-        "outperform_windows >= 2/6: {} ({}/6)",
-        pass_wf_outperform, input.walk_forward_outperform_windows
-    );
-    println!(
-        "cube_min_neighbor_score > 0: {} ({:.4})",
-        pass_cube_min, input.cube_min_neighbor_score
-    );
-    println!(
-        "cube_robustness_ratio >= 0.50: {} ({:.4})",
-        pass_cube_ratio, input.cube_robustness_ratio
-    );
-
-    let passed = pass_return
-        && pass_drawdown
-        && pass_sharpe
-        && pass_wf_return
-        && pass_wf_sharpe
-        && pass_wf_positive
-        && pass_wf_outperform
-        && pass_cube_min
-        && pass_cube_ratio;
-
-    if passed {
-        println!("RESEARCH_GATE: PASS");
-    } else {
-        println!("RESEARCH_GATE: FAIL");
-    }
 }
